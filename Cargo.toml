@@ -1,0 +1,32 @@
+[package]
+name = "ws_man"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "ws_man"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ws_man_bin"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "*", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+] }
+async-tungstenite = { version = "*", features = ["tokio-runtime"] }
+log = "0.4.17"
+serde = { version = "*", features = ['derive'] }
+serde_json = "*"
+bytes = "*"
+futures = "*"
+futures-util = "*"
+jwt = { version = "*", features = ["openssl"] }
+rand = "*"
+openssl = "*"
+env_logger = "*"
