@@ -8,10 +8,6 @@ edition = "2021"
 name = "ws_man"
 path = "src/lib.rs"
 
-[[bin]]
-name = "ws_man_bin"
-path = "src/main.rs"
-
 [dependencies]
 tokio = { version = "*", features = [
     "rt-multi-thread",
@@ -19,7 +15,7 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-async-tungstenite = { version = "*", features = ["tokio-runtime"] }
+tokio-tungstenite = "*"
 log = "0.4.17"
 serde = { version = "*", features = ['derive'] }
 serde_json = "*"
@@ -30,3 +26,4 @@ jwt = { version = "*", features = ["openssl"] }
 rand = "*"
 openssl = "*"
 env_logger = "*"
+async-trait = "*"

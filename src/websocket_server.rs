@@ -1,15 +1,12 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     marker::PhantomData,
-    ops::AddAssign,
+    ops::{AddAssign, DerefMut},
+    process::Output,
     sync::Arc,
 };
 
-use async_tungstenite::{
-    tokio::{accept_async, TokioAdapter},
-    tungstenite::{Error, Message},
-    WebSocketStream,
-};
+use async_trait::async_trait;
 use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
@@ -18,46 +15,84 @@ use jwt::{VerifyWithKey, VerifyingAlgorithm};
 use log::{error, info, warn};
 use openssl::pkey::PKey;
 use serde::Deserialize;
+use std::future::Future;
 use tokio::{
     net::{TcpListener, TcpStream},
-    runtime::Handle,
+    runtime::{Handle, Runtime},
     sync::RwLock,
-    task::JoinHandle,
+    task::{block_in_place, JoinHandle},
+};
+use tokio_tungstenite::{
+    accept_async,
+    tungstenite::{Error, Message},
+    WebSocketStream,
 };
 
 use crate::models::{JwtValidationMessage, TagSetsSpecifier};
 
 type UniqId = u128;
 type TagSetId = u32;
-type Stream = TokioAdapter<TcpStream>;
+type Stream = TcpStream;
 
 pub trait TagSets {
     fn tag_sets(&self) -> Vec<HashSet<String>>;
 }
 
-pub struct WebSocketManager<V: VerifyingAlgorithm> {
+#[async_trait]
+pub trait ClientCallback {
+    async fn callback(&self, ws_client: &mut WebSocketClient, message: Message);
+}
+
+#[async_trait]
+impl<F, Fut> ClientCallback for F
+where
+    F: (Fn(&mut WebSocketClient, Message) -> Fut) + Send + Sync + Clone + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    async fn callback(&self, ws_client: &mut WebSocketClient, message: Message) {
+        self(ws_client, message).await
+    }
+}
+
+pub struct WebSocketManager<F> {
     next_id: Arc<RwLock<UniqId>>,
     web_socket_maps: Arc<RwLock<HashMap<UniqId, Arc<RwLock<WebSocketClient>>>>>,
     tag_maps: Arc<RwLock<HashMap<String, Arc<RwLock<HashSet<(UniqId, TagSetId)>>>>>>,
-    jwt_verifier: Arc<V>,
+    client_message_callback: Arc<F>,
+    tcp_runtime: Runtime,
+    client_runtime: Runtime,
 }
 
-impl<V: VerifyingAlgorithm + Send + Sync + 'static> WebSocketManager<V> {
-    pub async fn new(tcp_listener: TcpListener, jwt_verifier: V) -> Arc<RwLock<Self>> {
+impl<F> WebSocketManager<F>
+where
+    F: ClientCallback + Send + Sync + 'static
+{
+    pub async fn new(
+        listener: TcpListener,
+        client_message_callback: F,
+    ) -> Result<Arc<RwLock<Self>>, Error> {
+        let tcp_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()?;
+
+        let client_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(8)
+            .build()?;
         let manager = Self {
             next_id: Default::default(),
             web_socket_maps: Default::default(),
             tag_maps: Default::default(),
-            jwt_verifier: Arc::new(jwt_verifier),
+            client_message_callback: Arc::new(client_message_callback),
+            tcp_runtime,
+            client_runtime,
         };
         info!("Creating Manager");
-        let locked_manager = Arc::new(RwLock::new(manager));
-        Self::spawn_listener(locked_manager.clone(), tcp_listener).await;
-        locked_manager
-    }
 
-    async fn spawn_listener(locked_manager: Arc<RwLock<Self>>, listener: TcpListener) {
-        tokio::spawn(async move {
+        let locked_manager = Arc::new(RwLock::new(manager));
+        let locked_manager_clone = locked_manager.clone();
+        locked_manager.read().await.tcp_runtime.spawn(async move {
             while let Ok((stream, addr)) = listener.accept().await {
                 let ws = match accept_async(stream).await {
                     Ok(ws) => ws,
@@ -67,27 +102,32 @@ impl<V: VerifyingAlgorithm + Send + Sync + 'static> WebSocketManager<V> {
                     }
                 };
 
-                locked_manager.read().await.insert_new_client(ws).await;
+                locked_manager_clone
+                    .read()
+                    .await
+                    .insert_new_client(ws)
+                    .await;
             }
         });
+        Ok(locked_manager)
     }
-
     /// Find all websockets that are authorized to receive a message.
     pub async fn find_authorized_clients(
-        &self,
-        authorized_tag_sets: Vec<HashSet<String>>,
+        tag_maps: Arc<RwLock<HashMap<String, Arc<RwLock<HashSet<(UniqId, TagSetId)>>>>>>,
+        authorized_tag_sets: &Vec<HashSet<String>>,
     ) -> HashSet<UniqId> {
+        let tag_maps = tag_maps.read().await;
         let mut candidate_set = HashSet::new();
         for authorized_tag_set in authorized_tag_sets {
             let mut tag_iter = authorized_tag_set.iter();
             if let Some(tag) = tag_iter.next() {
-                let mut candidates = match self.tag_maps.read().await.get(tag) {
+                let mut candidates = match tag_maps.get(tag) {
                     Some(candidates) => candidates.read().await.clone(),
                     None => HashSet::new(),
                 };
 
                 for tag in tag_iter {
-                    if let Some(intersection_candidates) = self.tag_maps.read().await.get(tag) {
+                    if let Some(intersection_candidates) = tag_maps.get(tag) {
                         let intersection_candidates = intersection_candidates.read().await;
                         candidates.retain(|v| intersection_candidates.contains(v))
                     } else {
@@ -123,66 +163,87 @@ impl<V: VerifyingAlgorithm + Send + Sync + 'static> WebSocketManager<V> {
             .await
             .insert(id, ws_client.clone());
 
-        let verifier = self.jwt_verifier.clone();
+        let client_message_callback = self.client_message_callback.clone();
 
         // Client listener
-        tokio::spawn(async move {
+        self.client_runtime.spawn(async move {
             ws_recv
                 .for_each(|res| async {
-                    let text = match res {
-                        Ok(Message::Text(text)) => text,
-                        _ => return,
-                    };
-                    let tag_sets: TagSetsSpecifier = match text.verify_with_key(verifier.as_ref()) {
-                        Ok(v) => v,
+                    // let text = match res {
+                    //     Ok(Message::Text(text)) => text,
+                    //     _ => return,
+                    // };
+                    // let tag_sets: TagSetsSpecifier = match text.verify_with_key(verifier.as_ref()) {
+                    //     Ok(v) => v,
+                    //     Err(e) => {
+                    //         println!("Invalid JWT request: {:?}", e);
+                    //         return;
+                    //     }
+                    // };
+
+                    let message = match res {
+                        Ok(message) => message,
                         Err(e) => {
-                            println!("Invalid JWT request: {:?}", e);
+                            warn!("Invalid message from client {:?}", e);
                             return;
                         }
                     };
 
-                    let mut write_guard = ws_client.write().await;
-                    // Give tag set permissions to client websocket
-                    for tag_set in tag_sets.tag_sets {
-                        write_guard
-                            .add_tag_set_permission(tag_set.into_iter().collect())
-                            .await;
-                    }
-                    let resp = match serde_json::to_string(&JwtValidationMessage {
-                        r#type: "jwt-validation".into(),
-                        success: true,
-                        token: text,
-                    }) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("Failed to create JWT validation response: {:?}", e);
-                            return;
-                        }
-                    };
-                    if let Err(e) = write_guard.send_message(Message::Text(resp)).await {
-                        error!("Failed to send JWT validation response to client: {:?}", e);
-                    }
+                    client_message_callback.callback(ws_client.write().await.deref_mut(), message).await;
+
+                    // let mut write_guard = ws_client.write().await;
+                    // // Give tag set permissions to client websocket
+                    // for tag_set in tag_sets {
+                    //     if tag_set.is_empty() {
+                    //         continue;
+                    //     }
+                    //     write_guard
+                    //         .add_tag_set_permission(tag_set.into_iter().collect())
+                    //         .await;
+                    // }
+                    // let resp = match serde_json::to_string(&JwtValidationMessage {
+                    //     r#type: "jwt-validation".into(),
+                    //     success: true,
+                    //     token: text,
+                    // }) {
+                    //     Ok(v) => v,
+                    //     Err(e) => {
+                    //         error!("Failed to create JWT validation response: {:?}", e);
+                    //         return;
+                    //     }
+                    // };
+                    // if let Some(response) = response {
+                    //     if let Err(e) = write_guard.send_message(response).await {
+                    //         error!("Failed to send validation response to client: {:?}", e);
+                    //     }
+                    // }
                 })
                 .await;
 
             ws_client.write().await.remove_client().await;
+
+            todo!()
         });
     }
 
-    pub async fn send_message(&self, tag_sets: Vec<HashSet<String>>, message: Message) {
-        let candidates = self.find_authorized_clients(tag_sets).await;
-        let read_guard = self.web_socket_maps.read().await;
-        for candidate in candidates {
-            if let Some(candidate) = read_guard.get(&candidate) {
-                if let Err(e) = candidate.write().await.send_message(message.clone()).await {
-                    error!("Error sending message to client: {:?}", e);
-                };
+    pub fn send_message(&self, tag_sets: Vec<HashSet<String>>, message: Message) {
+        let tag_maps = self.tag_maps.clone();
+        let web_socket_maps = self.web_socket_maps.clone();
+        self.client_runtime.spawn(async move {
+            let candidates = Self::find_authorized_clients(tag_maps, &tag_sets).await;
+            let read_guard = web_socket_maps.read().await;
+            for candidate in candidates {
+                if let Some(candidate) = read_guard.get(&candidate) {
+                    if let Err(e) = candidate.write().await.send_message(message.clone()).await {
+                        error!("Error sending message to client: {:?}", e);
+                    };
+                }
             }
-        }
+        });
     }
 }
 
-struct WebSocketClient {
+pub struct WebSocketClient {
     id: UniqId,
     next_tag_set_id: TagSetId,
     ws_send: SplitSink<WebSocketStream<Stream>, Message>,

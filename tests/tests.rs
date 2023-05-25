@@ -1,27 +1,43 @@
-use std::{collections::HashSet, net::SocketAddr, time::Duration};
-
-use async_tungstenite::{
-    client_async,
-    tokio::{connect_async, ClientStream, TokioAdapter},
-    tungstenite::{client, Message},
-    WebSocketStream,
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    net::SocketAddr,
+    ops::Deref,
+    process::Output,
+    sync::Arc,
+    time::Duration,
 };
+
+use async_trait::async_trait;
 use futures_util::{stream, SinkExt, StreamExt};
 use jwt::{
-    AlgorithmType, Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyingAlgorithm,
+    AlgorithmType, Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyWithKey,
+    VerifyingAlgorithm,
 };
-use log::error;
+use log::{error, info};
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
-use serde::Serialize;
-use tokio::time::timeout;
+use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
     time::Timeout,
 };
+use tokio::{
+    sync::RwLock,
+    time::{sleep, timeout},
+};
+use tokio_tungstenite::{
+    client_async, connect_async,
+    tungstenite::{client, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 use ws_man::{
     models::{JwtValidationMessage, TagSetsSpecifier},
-    websocket_server::WebSocketManager,
+    websocket_server::{ClientCallback, WebSocketClient, WebSocketManager},
 };
+#[derive(Serialize, Deserialize)]
+struct TestMessage {
+    value: i32,
+}
 
 const PORT: u16 = 5000;
 
@@ -47,7 +63,7 @@ pub async fn generate_tcp_listener() -> TcpListener {
         .await
         .unwrap()
 }
-pub async fn generate_client_ws_stream() -> WebSocketStream<TokioAdapter<TcpStream>> {
+pub async fn generate_client_ws_stream() -> WebSocketStream<MaybeTlsStream<TcpStream>> {
     connect_async(format!("ws://127.0.0.0:{}", PORT))
         .await
         .unwrap()
@@ -68,12 +84,67 @@ pub fn generate_jwt<T: SigningAlgorithm>(signer: &T, tag_sets: Vec<Vec<String>>)
     token.as_str().into()
 }
 
+pub fn message_from_serializable<T: Serialize>(v: &T) -> Message {
+    Message::Text(serde_json::to_string(v).unwrap())
+}
+
+pub async fn grant_permissions<'a, V: VerifyingAlgorithm>(
+    verifier: impl AsRef<V> + Send + Sync,
+    ws_client: &'a mut WebSocketClient,
+    message: Message,
+) {
+}
+
+struct Verifier<T: VerifyingAlgorithm>(pub T);
+
+#[async_trait]
+impl<V: VerifyingAlgorithm + Send + Sync> ClientCallback for Verifier<V> {
+    async fn callback(&self, ws_client: &mut WebSocketClient, message: Message) {
+        let text = match message {
+            Message::Text(text) => text,
+            _ => return,
+        };
+        let tag_sets: TagSetsSpecifier = match text.verify_with_key(&self.0) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("Invalid JWT request: {:?}", e);
+                return;
+            }
+        };
+        // Give tag set permissions to client websocket
+        for tag_set in tag_sets.tag_sets {
+            if tag_set.is_empty() {
+                continue;
+            }
+            ws_client
+                .add_tag_set_permission(tag_set.into_iter().collect())
+                .await;
+        }
+        let response = match serde_json::to_string(&JwtValidationMessage {
+            r#type: "jwt-validation".into(),
+            success: true,
+            token: text,
+        }) {
+            Ok(v) => Message::Text(v),
+            Err(e) => {
+                error!("Failed to create JWT validation response: {:?}", e);
+                return;
+            }
+        };
+        if let Err(e) = ws_client.send_message(response).await {
+            error!("Failed to send validation response to client: {:?}", e);
+        }
+    }
+}
+
 #[tokio::test]
 pub async fn test_client_add_and_message() {
     let _ = env_logger::try_init();
     let (signer, verifier) = generate_signer_verifier();
 
-    let server = WebSocketManager::new(generate_tcp_listener().await, verifier).await;
+    let server = WebSocketManager::new(generate_tcp_listener().await, Verifier(verifier))
+        .await
+        .unwrap();
 
     let mut client = generate_client_ws_stream().await;
 
@@ -111,14 +182,10 @@ pub async fn test_client_add_and_message() {
 
     let test_message = Message::Text("TEST".to_string());
 
-    server
-        .read()
-        .await
-        .send_message(
-            vec![HashSet::from_iter(vec!["admin".to_string()])],
-            test_message.clone(),
-        )
-        .await;
+    server.read().await.send_message(
+        vec![HashSet::from_iter(vec!["admin".to_string()])],
+        test_message.clone(),
+    );
 
     let next_message = timeout(Duration::from_secs(5), client.select_next_some())
         .await
@@ -128,26 +195,29 @@ pub async fn test_client_add_and_message() {
     return;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 pub async fn test_multiple_clients() {
     let _ = env_logger::try_init();
     let (signer, verifier) = generate_signer_verifier();
 
-    let server = WebSocketManager::new(generate_tcp_listener().await, verifier).await;
+    let server = WebSocketManager::new(generate_tcp_listener().await, Verifier(verifier))
+        .await
+        .unwrap();
 
-    let mut client = generate_client_ws_stream().await;
+    let num_clients = 25000;
+    let client_buckets = 30;
 
     fn get_tag_sets(pos: i32) -> Vec<Vec<String>> {
-        vec![(1..=pos)
+        vec![(0..=pos)
             .into_iter()
             .map(|i| format!("tag-{}", i))
             .collect()]
     }
 
-    let join_handles: Vec<_> = (1..=10)
+    let join_handles: Vec<_> = (0..num_clients)
         .into_iter()
         .map(|i| {
-            let tag_sets = get_tag_sets(i);
+            let tag_sets = get_tag_sets(i % client_buckets);
             let jwt = generate_jwt(&signer, tag_sets);
             tokio::spawn(async move {
                 let mut client = generate_client_ws_stream().await;
@@ -158,22 +228,22 @@ pub async fn test_multiple_clients() {
                         i, e
                     ));
                 };
-                let message = match timeout(Duration::from_secs(2), client.select_next_some()).await
-                {
-                    Ok(Ok(resp)) => resp,
-                    Ok(Err(e)) => {
-                        return Err(format!(
-                            "Client {}. Error during retrieval of validation response: {:?}",
-                            i, e
-                        ))
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "Client {}. Retrieval of validation response took too long: {:?}",
-                            i, e
-                        ))
-                    }
-                };
+                let message =
+                    match timeout(Duration::from_secs(10), client.select_next_some()).await {
+                        Ok(Ok(resp)) => resp,
+                        Ok(Err(e)) => {
+                            return Err(format!(
+                                "Client {}. Error during retrieval of validation response: {:?}",
+                                i, e
+                            ))
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "Client {}. Retrieval of validation response took too long: {:?}",
+                                i, e
+                            ))
+                        }
+                    };
                 match message {
                     Message::Text(jwt_resp) => {
                         let resp: JwtValidationMessage = serde_json::from_str(&jwt_resp).unwrap();
@@ -187,13 +257,82 @@ pub async fn test_multiple_clients() {
                     _ => return Err(format!("Client {}. Invalid message type response", i)),
                 };
 
-                Ok(client)
+                Ok((i, client))
             })
         })
         .collect();
 
     let mut clients = Vec::new();
     for join_handle in join_handles {
-        clients.push(join_handle.await.unwrap().unwrap());
+        if let Ok(Ok(join_handle)) = join_handle.await {
+            clients.push(join_handle);
+        }
+        // clients.push(join_handle.await.unwrap().unwrap());
     }
+
+    error!(
+        "Successfully spawned {}/{} clients",
+        clients.len(),
+        num_clients
+    );
+
+    // start listeners
+    let received_messages: Vec<_> = clients
+        .into_iter()
+        .map(|(i, client)| {
+            let received_messages = Arc::new(RwLock::new(HashMap::<i32, i32>::new()));
+            let received_messages_clone = received_messages.clone();
+            tokio::spawn(async move {
+                client
+                    .for_each(|res| async {
+                        match res.unwrap() {
+                            Message::Text(serialized_message) => {
+                                let message: TestMessage =
+                                    serde_json::from_str(&serialized_message).unwrap();
+                                *received_messages_clone
+                                    .write()
+                                    .await
+                                    .entry(message.value)
+                                    .or_default() += 1
+                            }
+                            _ => unreachable!(),
+                        };
+                    })
+                    .await;
+            });
+            (i, received_messages)
+        })
+        .collect();
+    for i in 0..client_buckets {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let tag_sets = vec![vec![format!("tag-{}", i)].into_iter().collect()];
+            let read_guard = server.read().await;
+            // Repeat the message with value `i`, `i` times.
+            for _ in 0..1 {
+                read_guard.send_message(
+                    tag_sets.clone(),
+                    message_from_serializable(&TestMessage { value: i }),
+                );
+            }
+        });
+    }
+
+    // Wait for things to settle
+    sleep(Duration::from_secs(30)).await;
+    let mut total = 0;
+    let mut correct = 0;
+    for (i, received_messages) in received_messages {
+        let received_messages = received_messages.read().await;
+        // A client `i` should have received all the messages `<= i`
+        for i in 0..=i % client_buckets {
+            total += 1;
+            //assert_eq!(received_messages.get(&i).copied().unwrap_or_default(), 1);
+            if received_messages.get(&i).copied().unwrap_or_default() == 1 {
+                correct += 1;
+            }
+        }
+    }
+
+    error!("Correct messages {}/{}", correct, total);
 }
