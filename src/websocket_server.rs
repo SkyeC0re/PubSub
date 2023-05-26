@@ -169,17 +169,6 @@ where
         self.client_runtime.spawn(async move {
             ws_recv
                 .for_each(|res| async {
-                    // let text = match res {
-                    //     Ok(Message::Text(text)) => text,
-                    //     _ => return,
-                    // };
-                    // let tag_sets: TagSetsSpecifier = match text.verify_with_key(verifier.as_ref()) {
-                    //     Ok(v) => v,
-                    //     Err(e) => {
-                    //         println!("Invalid JWT request: {:?}", e);
-                    //         return;
-                    //     }
-                    // };
 
                     let message = match res {
                         Ok(message) => message,
@@ -190,33 +179,6 @@ where
                     };
 
                     client_message_callback.callback(ws_client.write().await.deref_mut(), message).await;
-
-                    // let mut write_guard = ws_client.write().await;
-                    // // Give tag set permissions to client websocket
-                    // for tag_set in tag_sets {
-                    //     if tag_set.is_empty() {
-                    //         continue;
-                    //     }
-                    //     write_guard
-                    //         .add_tag_set_permission(tag_set.into_iter().collect())
-                    //         .await;
-                    // }
-                    // let resp = match serde_json::to_string(&JwtValidationMessage {
-                    //     r#type: "jwt-validation".into(),
-                    //     success: true,
-                    //     token: text,
-                    // }) {
-                    //     Ok(v) => v,
-                    //     Err(e) => {
-                    //         error!("Failed to create JWT validation response: {:?}", e);
-                    //         return;
-                    //     }
-                    // };
-                    // if let Some(response) = response {
-                    //     if let Err(e) = write_guard.send_message(response).await {
-                    //         error!("Failed to send validation response to client: {:?}", e);
-                    //     }
-                    // }
                 })
                 .await;
 

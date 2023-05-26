@@ -88,13 +88,6 @@ pub fn message_from_serializable<T: Serialize>(v: &T) -> Message {
     Message::Text(serde_json::to_string(v).unwrap())
 }
 
-pub async fn grant_permissions<'a, V: VerifyingAlgorithm>(
-    verifier: impl AsRef<V> + Send + Sync,
-    ws_client: &'a mut WebSocketClient,
-    message: Message,
-) {
-}
-
 struct Verifier<T: VerifyingAlgorithm>(pub T);
 
 #[async_trait]
