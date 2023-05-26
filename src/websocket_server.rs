@@ -1,34 +1,25 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    marker::PhantomData,
+    collections::{HashMap, HashSet},
     ops::{AddAssign, DerefMut},
-    process::Output,
     sync::Arc,
 };
 
 use async_trait::async_trait;
-use futures_util::{
-    stream::{SplitSink, SplitStream},
-    SinkExt, StreamExt,
-};
-use jwt::{VerifyWithKey, VerifyingAlgorithm};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+
 use log::{error, info, warn};
-use openssl::pkey::PKey;
-use serde::Deserialize;
+
 use std::future::Future;
 use tokio::{
     net::{TcpListener, TcpStream},
-    runtime::{Handle, Runtime},
+    runtime::Runtime,
     sync::RwLock,
-    task::{block_in_place, JoinHandle},
 };
 use tokio_tungstenite::{
     accept_async,
     tungstenite::{Error, Message},
     WebSocketStream,
 };
-
-use crate::models::{JwtValidationMessage, TagSetsSpecifier};
 
 type UniqId = u128;
 type TagSetId = u32;
@@ -65,7 +56,7 @@ pub struct WebSocketManager<F> {
 
 impl<F> WebSocketManager<F>
 where
-    F: ClientCallback + Send + Sync + 'static
+    F: ClientCallback + Send + Sync + 'static,
 {
     pub async fn new(
         listener: TcpListener,
@@ -169,7 +160,6 @@ where
         self.client_runtime.spawn(async move {
             ws_recv
                 .for_each(|res| async {
-
                     let message = match res {
                         Ok(message) => message,
                         Err(e) => {
@@ -178,7 +168,9 @@ where
                         }
                     };
 
-                    client_message_callback.callback(ws_client.write().await.deref_mut(), message).await;
+                    client_message_callback
+                        .callback(ws_client.write().await.deref_mut(), message)
+                        .await;
                 })
                 .await;
 

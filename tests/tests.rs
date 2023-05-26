@@ -1,35 +1,23 @@
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
-    net::SocketAddr,
-    ops::Deref,
-    process::Output,
     sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
-use futures_util::{stream, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use jwt::{
-    AlgorithmType, Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyWithKey,
-    VerifyingAlgorithm,
+    Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyWithKey, VerifyingAlgorithm,
 };
-use log::{error, info};
+use log::error;
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    time::Timeout,
-};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::{
     sync::RwLock,
     time::{sleep, timeout},
 };
-use tokio_tungstenite::{
-    client_async, connect_async,
-    tungstenite::{client, Message},
-    MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use ws_man::{
     models::{JwtValidationMessage, TagSetsSpecifier},
     websocket_server::{ClientCallback, WebSocketClient, WebSocketManager},
