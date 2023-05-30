@@ -98,7 +98,7 @@ impl<V: VerifyingAlgorithm + Send + Sync> ClientCallback for Verifier<V> {
                 continue;
             }
             ws_client
-                .add_tag_set_permission(tag_set.into_iter().collect())
+                .subscribe_to_topic(tag_set.into_iter().collect())
                 .await;
         }
         let response = match serde_json::to_string(&JwtValidationMessage {
@@ -300,7 +300,7 @@ pub async fn test_multiple_clients() {
     }
 
     // Wait for things to settle
-    sleep(Duration::from_secs(30)).await;
+    sleep(Duration::from_secs(5)).await;
     let mut total = 0;
     let mut correct = 0;
     for (i, received_messages) in received_messages {
