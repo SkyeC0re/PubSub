@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    ops::{AddAssign, Deref, DerefMut},
+    ops::{AddAssign, Deref},
     sync::{Arc, Weak},
 };
 
@@ -22,25 +22,32 @@ use tokio_tungstenite::{
 };
 
 type UniqId = u128;
-type TagSetId = u32;
 type Stream = TcpStream;
+type TopicTreeNode<V> = Arc<RwLock<TopicNode<V>>>;
+type WeakTopicTreeNode<V> = Weak<RwLock<TopicNode<V>>>;
 pub trait TagSets {
     fn tag_sets(&self) -> Vec<HashSet<String>>;
 }
 
 #[async_trait]
-pub trait ClientCallback {
-    async fn callback(&self, ws_client: &mut WebSocketClient, message: Message);
+pub trait ClientCallback<M, E> {
+    async fn callback(&self, client: &dyn Client<M, E>, message: M);
 }
 
 #[async_trait]
-impl<F, Fut> ClientCallback for F
+pub trait Client<M, E>: Send + Sync {
+    async fn send_message(&self, message: M) -> Result<(), E>;
+}
+
+#[async_trait]
+impl<M, E, F, Fut> ClientCallback<M, E> for F
 where
-    F: (Fn(&mut WebSocketClient, Message) -> Fut) + Send + Sync + Clone + 'static,
+    F: (Fn(&dyn Client<M, E>, M) -> Fut) + Send + Sync + Clone + 'static,
     Fut: Future<Output = ()> + Send,
+    M: Send + Sync + 'static,
 {
-    async fn callback(&self, ws_client: &mut WebSocketClient, message: Message) {
-        self(ws_client, message).await
+    async fn callback(&self, client: &dyn Client<M, E>, message: M) {
+        self(client, message).await;
     }
 }
 
@@ -53,22 +60,28 @@ pub enum TopicSpecifier {
     },
 }
 
-#[derive(Clone, Default)]
-struct PruneGuardedTopicNode {
-    topic_node: Arc<RwLock<TopicNode>>,
-    prune_guard: Arc<RwLock<()>>,
-}
-
 #[derive(Default)]
-struct TopicNode {
-    pub topic_subscribers: HashMap<UniqId, WebSocketClient>,
-    wildcard_subtopic_subscribers: HashMap<UniqId, WebSocketClient>,
-    subtopics: HashMap<String, PruneGuardedTopicNode>,
-    parent: Option<PruneGuardedTopicNode>,
+struct TopicNode<V> {
+    topic_subscribers: HashMap<UniqId, V>,
+    wildcard_subtopic_subscribers: HashMap<UniqId, V>,
+    subtopics: HashMap<String, TopicTreeNode<V>>,
+    parent: Option<WeakTopicTreeNode<V>>,
     topic: String,
 }
 
-impl TopicNode {
+impl<V> TopicNode<V> {
+    pub fn new() -> Self {
+        Self {
+            topic_subscribers: HashMap::new(),
+            wildcard_subtopic_subscribers: HashMap::new(),
+            subtopics: HashMap::new(),
+            parent: None,
+            topic: "".to_string(),
+        }
+    }
+}
+
+impl<V> TopicNode<V> {
     pub fn is_empty_leaf(&self) -> bool {
         self.topic_subscribers.is_empty()
             && self.wildcard_subtopic_subscribers.is_empty()
@@ -76,16 +89,31 @@ impl TopicNode {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct TopicTree {
-    tree: PruneGuardedTopicNode,
+#[derive(Clone)]
+pub struct TopicTree<V> {
+    next_id: Arc<Mutex<UniqId>>,
+    tree: TopicTreeNode<V>,
 }
 
-impl TopicTree {
+impl<V: Clone> TopicTree<V> {
+    pub fn new() -> Self {
+        Self {
+            next_id: Arc::default(),
+            tree: Arc::new(RwLock::new(TopicNode::new())),
+        }
+    }
+
+    pub async fn next_id(&self) -> UniqId {
+        let mut next_id = self.next_id.lock().await;
+        let id = next_id.clone();
+        next_id.add_assign(&1);
+        id
+    }
+
     pub async fn find_subscribers(
         &self,
         topic: &TopicSpecifier,
-        collector: &mut HashMap<UniqId, WebSocketClient>,
+        collector: &mut HashMap<UniqId, V>,
     ) {
         let mut current_branch = self.tree.clone();
         let mut current_topic = topic;
@@ -97,7 +125,7 @@ impl TopicTree {
                     break;
                 }
                 TopicSpecifier::OnlySubtopics => {
-                    let current_branch = current_branch.topic_node.read().await;
+                    let current_branch = current_branch.read().await;
                     for (id, client) in &current_branch.wildcard_subtopic_subscribers {
                         collector.insert(*id, client.clone());
                     }
@@ -109,7 +137,7 @@ impl TopicTree {
                     break;
                 }
                 TopicSpecifier::Subtopic { topic, specifier } => {
-                    let current_branch_read_guard = current_branch.topic_node.read().await;
+                    let current_branch_read_guard = current_branch.read().await;
                     if let Some(subtopic) = current_branch_read_guard.subtopics.get(topic).cloned()
                     {
                         drop(current_branch_read_guard);
@@ -124,12 +152,12 @@ impl TopicTree {
     }
 
     async fn collect_all_subscribers(
-        trees: Vec<PruneGuardedTopicNode>,
-        collector: &mut HashMap<UniqId, WebSocketClient>,
+        trees: Vec<TopicTreeNode<V>>,
+        collector: &mut HashMap<UniqId, V>,
     ) {
         let mut unvisited_branches = trees;
         while let Some(branch) = unvisited_branches.pop() {
-            let branch = branch.topic_node.read().await;
+            let branch = branch.read().await;
             for (id, client) in &branch.topic_subscribers {
                 collector.insert(*id, client.clone());
             }
@@ -140,17 +168,14 @@ impl TopicTree {
         }
     }
 
-    async fn subscribe_to_topic(&self, client: WebSocketClient, topic: &TopicSpecifier) {
-        let client_id = client.id;
-        let mut prune_guards = Vec::new();
-        let mut next_branch = self.tree.clone();
-        let mut next_topic = topic;
+    async fn subscribe_to_topic(&self, client: V, client_id: UniqId, topic: &TopicSpecifier) {
+        let mut current_branch = self.tree.clone();
+        let mut current_topic = topic;
 
         loop {
-            match next_topic {
+            match current_topic {
                 TopicSpecifier::TopicAndSubtopics => {
-                    next_branch
-                        .topic_node
+                    current_branch
                         .write()
                         .await
                         .topic_subscribers
@@ -158,8 +183,7 @@ impl TopicTree {
                     break;
                 }
                 TopicSpecifier::OnlySubtopics => {
-                    next_branch
-                        .topic_node
+                    current_branch
                         .write()
                         .await
                         .wildcard_subtopic_subscribers
@@ -167,128 +191,143 @@ impl TopicTree {
                     break;
                 }
                 TopicSpecifier::Subtopic { topic, specifier } => {
-                    next_topic = specifier;
-                    let current_branch_read_guard = next_branch.topic_node.read().await;
+                    current_topic = specifier;
+                    let current_branch_read_guard = current_branch.read().await;
 
-                    if let Some((subtopic_tree, prune_guard)) = current_branch_read_guard
-                        .subtopics
-                        .get(topic)
-                        .cloned()
-                        .and_then(|subtopic_tree| {
-                            if let Ok(prune_guard) =
-                                subtopic_tree.prune_guard.clone().try_read_owned()
-                            {
-                                Some((subtopic_tree, prune_guard))
-                            } else {
-                                None
-                            }
-                        })
+                    if let Some(subtopic_tree) =
+                        current_branch_read_guard.subtopics.get(topic).cloned()
                     {
                         drop(current_branch_read_guard);
-                        // Ensure that lower branches cannot be pruned during insertion process
-                        prune_guards.push(prune_guard);
-                        next_branch = subtopic_tree;
+                        current_branch = subtopic_tree;
                         continue;
                     }
                     drop(current_branch_read_guard);
 
                     // Branch did not exist previously, aquire write lock and create if still required
 
-                    let mut current_branch_write_guard = next_branch.topic_node.write().await;
-                    if let Some((subtopic_tree, prune_guard)) = current_branch_write_guard
-                        .subtopics
-                        .get(topic)
-                        .cloned()
-                        .and_then(|subtopic_tree| {
-                            if let Ok(prune_guard) =
-                                subtopic_tree.prune_guard.clone().try_read_owned()
-                            {
-                                Some((subtopic_tree, prune_guard))
-                            } else {
-                                None
-                            }
-                        })
+                    let mut current_branch_write_guard = current_branch.write().await;
+                    if let Some(subtopic_tree) =
+                        current_branch_write_guard.subtopics.get(topic).cloned()
                     {
                         drop(current_branch_write_guard);
-                        // Ensure that lower branches cannot be pruned during insertion process
-                        prune_guards.push(prune_guard);
-                        next_branch = subtopic_tree;
+                        current_branch = subtopic_tree;
                         continue;
                     }
 
-                    let subtopic_tree = PruneGuardedTopicNode {
-                        topic_node: Arc::new(RwLock::new(TopicNode {
-                            parent: Some(next_branch.clone()),
-                            ..Default::default()
-                        })),
-                        prune_guard: Default::default(),
-                    };
-
-                    prune_guards.push(subtopic_tree.prune_guard.clone().read_owned().await);
+                    let subtopic_leaf = Arc::new(RwLock::new(TopicNode {
+                        parent: Some(Arc::downgrade(&current_branch)),
+                        topic: topic.clone(),
+                        topic_subscribers: HashMap::new(),
+                        wildcard_subtopic_subscribers: HashMap::new(),
+                        subtopics: HashMap::new(),
+                    }));
 
                     current_branch_write_guard
                         .subtopics
-                        .insert(topic.clone(), subtopic_tree.clone());
+                        .insert(topic.clone(), subtopic_leaf.clone());
                     drop(current_branch_write_guard);
-                    next_branch = subtopic_tree;
+                    current_branch = subtopic_leaf;
                 }
             }
         }
     }
 
-    async fn unsubscribe_from_topic(&self, client: WebSocketClient, topic: &TopicSpecifier) {
-        
+    async fn unsubscribe_from_topic(
+        &self,
+        client_id: &UniqId,
+        topic: &TopicSpecifier,
+    ) -> Option<TopicTreeNode<V>> {
+        let mut current_branch = self.tree.clone();
+        let mut current_topic = topic;
+
+        loop {
+            match current_topic {
+                TopicSpecifier::TopicAndSubtopics => {
+                    current_branch
+                        .write()
+                        .await
+                        .topic_subscribers
+                        .remove(client_id);
+                    break;
+                }
+                TopicSpecifier::OnlySubtopics => {
+                    current_branch
+                        .write()
+                        .await
+                        .wildcard_subtopic_subscribers
+                        .remove(client_id);
+                    break;
+                }
+                TopicSpecifier::Subtopic { topic, specifier } => {
+                    current_topic = specifier;
+                    let current_branch_read_guard = current_branch.read().await;
+
+                    if let Some(subtopic_tree) =
+                        current_branch_read_guard.subtopics.get(topic).cloned()
+                    {
+                        drop(current_branch_read_guard);
+                        current_branch = subtopic_tree;
+                    } else {
+                        // Nothing to do, client was never on that topic
+                        return None;
+                    }
+                }
+            }
+        }
+
+        return Some(current_branch);
     }
 
     /// Attempt to prune empty branches of a topic, starting at the furthermost branch and working back to the root.
-    /// Here all terminal topic specifiers are treated as equal and the function will attempt pruning from that branch.
-    async fn prune_branch(branch: PruneGuardedTopicNode) {
-        let mut current_branch = branch;
-        loop {
-            let prune_guard = if let Ok(prune_guard) = current_branch.prune_guard.try_write_owned()
+    async fn prune_leaf(leaf: TopicTreeNode<V>) {
+        let mut owned_read_guard = leaf.read_owned().await;
+        while owned_read_guard.is_empty_leaf() {
+            let parent_branch = if let Some(parent_branch) = owned_read_guard
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.upgrade())
             {
-                prune_guard
+                parent_branch
             } else {
+                // Reached root or has already been pruned
                 return;
             };
-            let branch = current_branch.topic_node.read().await;
 
-            if !branch.is_empty_leaf() {
+            let sub_topic = owned_read_guard.topic.clone();
+
+            drop(owned_read_guard);
+            let mut parent_branch_write_guard = parent_branch.write_owned().await;
+
+            let child_branch =
+                if let Some(child_branch) = parent_branch_write_guard.subtopics.get(&sub_topic) {
+                    child_branch
+                } else {
+                    // Another prune operation has already removed the branch
+                    return;
+                };
+
+            if child_branch.read().await.is_empty_leaf() {
+                parent_branch_write_guard.subtopics.remove(&sub_topic);
+            } else {
+                // The child branch has been populated in the meantime and is no longer empty
                 return;
             }
 
-            let parent_branch = if let Some(parent_branch) = branch.parent.clone() {
-                parent_branch
-            } else {
-                return;
-            };
-
-            parent_branch
-                .topic_node
-                .write()
-                .await
-                .subtopics
-                .remove(&branch.topic);
-
-            drop(branch);
-            current_branch = parent_branch;
+            owned_read_guard = parent_branch_write_guard.downgrade();
         }
     }
 }
 
 pub struct WebSocketManager<F> {
-    next_id: Arc<RwLock<UniqId>>,
-    web_socket_maps: Arc<RwLock<HashMap<UniqId, Arc<RwLock<WebSocketClient>>>>>,
-    topic_tree: TopicTree,
-    tag_maps: Arc<RwLock<HashMap<String, Arc<RwLock<HashSet<(UniqId, TagSetId)>>>>>>,
-    client_message_callback: Arc<F>,
+    topic_tree: TopicTree<WebSocketClient<F>>,
+    client_message_callback: F,
     tcp_runtime: Runtime,
     client_runtime: Runtime,
 }
 
 impl<F> WebSocketManager<F>
 where
-    F: ClientCallback + Send + Sync + 'static,
+    F: ClientCallback<Message, Error> + Send + Sync + Clone + 'static,
 {
     pub async fn new(
         listener: TcpListener,
@@ -305,11 +344,8 @@ where
             .build()?;
 
         let manager = Self {
-            next_id: Default::default(),
-            web_socket_maps: Default::default(),
-            topic_tree: Default::default(),
-            tag_maps: Default::default(),
-            client_message_callback: Arc::new(client_message_callback),
+            topic_tree: TopicTree::new(),
+            client_message_callback,
             tcp_runtime,
             client_runtime,
         };
@@ -334,9 +370,9 @@ where
     }
     /// Find all websockets that are authorized to receive a message.
     pub async fn find_authorized_clients(
-        topic_tree: &TopicTree,
+        topic_tree: &TopicTree<WebSocketClient<F>>,
         topics: impl IntoIterator<Item = &TopicSpecifier>,
-    ) -> HashMap<UniqId, WebSocketClient> {
+    ) -> HashMap<UniqId, WebSocketClient<F>> {
         let mut candidate_set = HashMap::new();
         for topic in topics {
             topic_tree.find_subscribers(topic, &mut candidate_set).await;
@@ -345,9 +381,7 @@ where
     }
 
     pub async fn insert_new_client(&self, ws: WebSocketStream<Stream>) {
-        let mut next_id = self.next_id.write().await;
-        let id = next_id.clone();
-        next_id.add_assign(1);
+        let id = self.topic_tree.next_id().await;
 
         let (ws_send, ws_recv) = ws.split();
         let ws_client = WebSocketClient {
@@ -356,17 +390,11 @@ where
                 ws_send: Mutex::new(ws_send),
                 topic_tree: self.topic_tree.clone(),
                 subscribed_topics: Default::default(),
+                callback_function: self.client_message_callback.clone(),
             }),
         };
 
         let ws_client = Arc::new(RwLock::new(ws_client));
-
-        self.web_socket_maps
-            .write()
-            .await
-            .insert(id, ws_client.clone());
-
-        let client_message_callback = self.client_message_callback.clone();
 
         // Client listener
         self.client_runtime.spawn(async move {
@@ -380,19 +408,21 @@ where
                         }
                     };
 
-                    client_message_callback
-                        .callback(ws_client.write().await.deref_mut(), message)
+                    let read_guard = ws_client.read().await;
+
+                    read_guard
+                        .callback_function
+                        .callback(read_guard.deref(), message)
                         .await;
                 })
                 .await;
 
-            ws_client.write().await.remove_client().await;
+            // TODO ws_client.write().await.remove_client().await;
         });
     }
 
     pub fn send_message(&self, topics: Vec<TopicSpecifier>, message: Message) {
         let topic_tree = self.topic_tree.clone();
-        let web_socket_maps = self.web_socket_maps.clone();
         self.client_runtime.spawn(async move {
             let candidates = Self::find_authorized_clients(&topic_tree, &topics).await;
             for candidate in candidates.into_values() {
@@ -405,38 +435,47 @@ where
 }
 
 #[derive(Clone)]
-pub struct WebSocketClient {
-    inner: Arc<WebSocketClientInner>,
+pub struct WebSocketClient<F> {
+    inner: Arc<WebSocketClientInner<F>>,
 }
 
-impl Deref for WebSocketClient {
-    type Target = WebSocketClientInner;
+#[async_trait]
+impl<F> Client<Message, Error> for WebSocketClient<F>
+where
+    F: ClientCallback<Message, Error> + Send + Sync + Clone + 'static,
+{
+    async fn send_message(&self, message: Message) -> Result<(), Error> {
+        self.send_message(message).await
+    }
+}
+
+impl<F> Deref for WebSocketClient<F> {
+    type Target = WebSocketClientInner<F>;
 
     fn deref(&self) -> &Self::Target {
         self.inner.as_ref()
     }
 }
 
-pub struct WebSocketClientInner {
+pub struct WebSocketClientInner<F> {
     id: UniqId,
     ws_send: Mutex<SplitSink<WebSocketStream<Stream>, Message>>,
     subscribed_topics: RwLock<HashSet<TopicSpecifier>>,
-    topic_tree: TopicTree,
+    topic_tree: TopicTree<WebSocketClient<F>>,
+    callback_function: F,
 }
 
-impl WebSocketClient {
-    pub async fn subscribe_to_topic(&self, topic: TopicSpecifier) {
-        self.topic_tree.subscribe_to_topic(self.clone(), &topic).await
+impl<F> WebSocketClient<F>
+where
+    F: ClientCallback<WebSocketClient<F>, Error> + Send + Sync + Clone + 'static,
+{
+    pub async fn subscribe_to_topic(&self, topic: &TopicSpecifier) {
+        self.topic_tree
+            .subscribe_to_topic(self.clone(), self.id, topic)
+            .await
     }
 
-    pub async fn remove_client(&mut self) {
-        self.web_socket_maps.write().await.remove(&self.id);
-        let tag_set_ids = self.tag_set_permissions.keys().copied().collect::<Vec<_>>();
-        for tag_set_id in tag_set_ids {
-            self.remove_tag_set(tag_set_id).await;
-        }
-        self.tag_set_permissions = HashMap::new();
-    }
+    pub async fn unsubscribe_from_topic(&self, topic: &TopicSpecifier) {todo!()}
 
     pub async fn send_message(&self, message: Message) -> Result<(), Error> {
         self.ws_send.lock().await.send(message).await
