@@ -58,9 +58,9 @@ where
 #[derive(PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub enum TopicSpecifier {
     #[serde(rename = "*")]
-    TopicAndSubtopics,
+    Wildcard,
     #[serde(rename = ".")]
-    OnlySubtopics,
+    ThisTopic,
     #[serde(rename = "st")]
     Subtopic {
         #[serde(rename = "t")]
@@ -130,20 +130,12 @@ impl<V: Clone + Send + Sync + 'static> TopicTree<V> {
 
         loop {
             match current_topic {
-                TopicSpecifier::TopicAndSubtopics => {
-                    Self::collect_all_subscribers(vec![current_branch], collector).await;
+                TopicSpecifier::Wildcard => {
+                    Self::collect_all_subscribers(current_branch, collector, usize::MAX).await;
                     break;
                 }
-                TopicSpecifier::OnlySubtopics => {
-                    let current_branch = current_branch.read().await;
-                    for (id, client) in &current_branch.wildcard_subtopic_subscribers {
-                        collector.insert(*id, client.clone());
-                    }
-                    Self::collect_all_subscribers(
-                        current_branch.subtopics.values().cloned().collect(),
-                        collector,
-                    )
-                    .await;
+                TopicSpecifier::ThisTopic => {
+                    Self::collect_all_subscribers(current_branch, collector, 0).await;
                     break;
                 }
                 TopicSpecifier::Subtopic { topic, specifier } => {
@@ -165,11 +157,12 @@ impl<V: Clone + Send + Sync + 'static> TopicTree<V> {
     }
 
     async fn collect_all_subscribers(
-        trees: Vec<TopicTreeNode<V>>,
+        branch: TopicTreeNode<V>,
         collector: &mut HashMap<UniqId, V>,
+        depth: usize,
     ) {
-        let mut unvisited_branches = trees;
-        while let Some(branch) = unvisited_branches.pop() {
+        let mut unvisited_branches = vec![(branch, depth)];
+        while let Some((branch, depth)) = unvisited_branches.pop() {
             let branch = branch.read().await;
             for (id, client) in &branch.topic_subscribers {
                 collector.insert(*id, client.clone());
@@ -177,7 +170,16 @@ impl<V: Clone + Send + Sync + 'static> TopicTree<V> {
             for (id, client) in &branch.wildcard_subtopic_subscribers {
                 collector.insert(*id, client.clone());
             }
-            unvisited_branches.extend(branch.subtopics.values().cloned());
+
+            if depth > 0 {
+                unvisited_branches.extend(
+                    branch
+                        .subtopics
+                        .values()
+                        .cloned()
+                        .map(|unvisited_branch| (unvisited_branch, depth - 1)),
+                );
+            }
         }
     }
 
@@ -187,19 +189,19 @@ impl<V: Clone + Send + Sync + 'static> TopicTree<V> {
 
         loop {
             match current_topic {
-                TopicSpecifier::TopicAndSubtopics => {
-                    current_branch
-                        .write()
-                        .await
-                        .topic_subscribers
-                        .insert(client_id, client);
-                    break;
-                }
-                TopicSpecifier::OnlySubtopics => {
+                TopicSpecifier::Wildcard => {
                     current_branch
                         .write()
                         .await
                         .wildcard_subtopic_subscribers
+                        .insert(client_id, client);
+                    break;
+                }
+                TopicSpecifier::ThisTopic => {
+                    current_branch
+                        .write()
+                        .await
+                        .topic_subscribers
                         .insert(client_id, client);
                     break;
                 }
@@ -251,22 +253,22 @@ impl<V: Clone + Send + Sync + 'static> TopicTree<V> {
         let marked_for_pruning;
         loop {
             match current_topic {
-                TopicSpecifier::TopicAndSubtopics => {
-                    let current_branch_write_guard = current_branch.write().await;
-                    current_branch
-                        .write()
-                        .await
-                        .topic_subscribers
-                        .remove(client_id);
-                    marked_for_pruning = current_branch_write_guard.is_empty_leaf();
-                    break;
-                }
-                TopicSpecifier::OnlySubtopics => {
+                TopicSpecifier::Wildcard => {
                     let current_branch_write_guard = current_branch.write().await;
                     current_branch
                         .write()
                         .await
                         .wildcard_subtopic_subscribers
+                        .remove(client_id);
+                    marked_for_pruning = current_branch_write_guard.is_empty_leaf();
+                    break;
+                }
+                TopicSpecifier::ThisTopic => {
+                    let current_branch_write_guard = current_branch.write().await;
+                    current_branch
+                        .write()
+                        .await
+                        .topic_subscribers
                         .remove(client_id);
                     marked_for_pruning = current_branch_write_guard.is_empty_leaf();
                     break;

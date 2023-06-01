@@ -132,12 +132,12 @@ pub async fn test_client_add_and_message() {
 
     let permissions = TopicSpecifiers {
         topics: vec![
-            TopicSpecifier::TopicAndSubtopics,
+            TopicSpecifier::Wildcard,
             TopicSpecifier::Subtopic {
                 topic: "orders".to_string(),
                 specifier: Box::new(TopicSpecifier::Subtopic {
                     topic: "123".to_string(),
-                    specifier: Box::new(TopicSpecifier::TopicAndSubtopics),
+                    specifier: Box::new(TopicSpecifier::Wildcard),
                 }),
             },
         ],
@@ -176,7 +176,7 @@ pub async fn test_client_add_and_message() {
     server.send_message(
         vec![TopicSpecifier::Subtopic {
             topic: "random".to_string(),
-            specifier: Box::new(TopicSpecifier::OnlySubtopics),
+            specifier: Box::new(TopicSpecifier::ThisTopic),
         }],
         test_message.clone(),
     );
