@@ -1,14 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+use crate::websocket_server::TopicSpecifier;
+
 #[derive(Serialize, Deserialize)]
 pub struct AuthMessage {
     pub encrypted_tags: String,
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct TagSetsSpecifier {
-    pub tag_sets: Vec<Vec<String>>,
+pub struct TopicSpecifiers {
+    pub topics: Vec<TopicSpecifier>,
 }
 
 #[derive(Serialize, Deserialize)]
