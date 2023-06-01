@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    ops::{AddAssign, Deref},
+    ops::{AddAssign, Deref, DerefMut},
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -349,13 +349,10 @@ impl<F> WebSocketManager<F>
 where
     F: ClientCallback<WebSocketClient, Message, Error> + Send + Sync + 'static,
 {
-    pub async fn new(
-        listener: TcpListener,
-        client_message_callback: F,
-    ) -> Result<Arc<Self>, Error> {
+    pub async fn new(client_message_callback: F) -> Result<Arc<Self>, Error> {
         let tcp_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(2)
+            .worker_threads(3)
             .build()?;
 
         let client_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -372,8 +369,12 @@ where
         info!("Creating Manager");
 
         let locked_manager = Arc::new(manager);
-        let locked_manager_clone = locked_manager.clone();
-        locked_manager.tcp_runtime.spawn(async move {
+        Ok(locked_manager)
+    }
+
+    pub async fn add_listener(manager: &Arc<Self>, listener: TcpListener) {
+        let manager_clone = manager.clone();
+        manager.tcp_runtime.spawn(async move {
             while let Ok((stream, addr)) = listener.accept().await {
                 let ws = match accept_async(stream).await {
                     Ok(ws) => ws,
@@ -383,10 +384,9 @@ where
                     }
                 };
 
-                locked_manager_clone.insert_new_client(ws).await;
+                manager_clone.insert_new_client(ws).await;
             }
         });
-        Ok(locked_manager)
     }
     /// Find all websockets that are authorized to receive a message.
     pub async fn find_authorized_clients(
@@ -409,6 +409,7 @@ where
                 id,
                 ws_send: Mutex::new(ws_send),
                 topic_tree: self.topic_tree.clone(),
+                subscribed_topics: RwLock::default(),
             }),
         };
 
@@ -435,7 +436,7 @@ where
                 })
                 .await;
 
-            // TODO ws_client.write().await.remove_client().await;
+            ws_client.read().await.kill_client().await;
         });
     }
 
@@ -480,13 +481,16 @@ pub struct WebSocketClientInner {
     id: UniqId,
     ws_send: Mutex<SplitSink<WebSocketStream<Stream>, Message>>,
     topic_tree: TopicTree<WebSocketClient>,
+    subscribed_topics: RwLock<HashSet<TopicSpecifier>>,
 }
 
 impl WebSocketClient {
     pub async fn subscribe_to_topic(&self, topic: &TopicSpecifier) {
         self.topic_tree
             .subscribe_to_topic(self.id, self.clone(), topic)
-            .await
+            .await;
+
+        self.subscribed_topics.write().await.insert(topic.clone());
     }
 
     pub async fn unsubscribe_from_topic(&self, topic: &TopicSpecifier) {
@@ -497,5 +501,13 @@ impl WebSocketClient {
 
     pub async fn send_message(&self, message: &Message) -> Result<(), Error> {
         self.ws_send.lock().await.send(message.clone()).await
+    }
+
+    pub async fn kill_client(&self) {
+        let mut subscribed_topics_write_guard = self.subscribed_topics.write().await;
+        for topic in subscribed_topics_write_guard.iter() {
+            self.unsubscribe_from_topic(topic).await;
+        }
+        *subscribed_topics_write_guard.deref_mut() = HashSet::new();
     }
 }
