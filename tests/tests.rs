@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    ops::{AddAssign, Deref},
     sync::Arc,
-    time::Duration, ops::{AddAssign, Deref},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -24,7 +25,9 @@ use tokio_tungstenite::{
 };
 use ws_man::{
     models::{JwtValidationMessage, TopicSpecifiers},
-    websocket_server::{Client, ClientCallback, TopicSpecifier, WebSocketClient, WebSocketManager},
+    websocket_server::{
+        Client, ClientCallback, TopicSpecifier, UniqId, WebSocketClient, WebSocketManager,
+    },
 };
 #[derive(Serialize, Deserialize)]
 struct TestMessage {
@@ -85,7 +88,7 @@ pub fn message_from_serializable<T: Serialize>(v: &T) -> Message {
 struct Verifier<T: VerifyingAlgorithm>(pub T);
 
 #[async_trait]
-impl<V: VerifyingAlgorithm + Send + Sync> ClientCallback<WebSocketClient, Message, Error>
+impl<V: VerifyingAlgorithm + Send + Sync> ClientCallback<WebSocketClient, UniqId, Message, Error>
     for Verifier<V>
 {
     async fn callback(&self, ws_client: &WebSocketClient, message: Message) {
@@ -126,9 +129,7 @@ pub async fn test_client_add_and_message() {
     let _ = env_logger::try_init();
     let (signer, verifier) = generate_signer_verifier();
 
-    let server = WebSocketManager::new(Verifier(verifier))
-        .await
-        .unwrap();
+    let server = WebSocketManager::new(Verifier(verifier)).await.unwrap();
 
     WebSocketManager::add_listener(&server, generate_tcp_listener(PORT).await).await;
 
@@ -336,7 +337,10 @@ pub async fn test_multiple_clients() {
     // Wait for things to settle
     for _ in 0..25 {
         sleep(Duration::from_secs(1)).await;
-        error!("Messages received so far: {}", total_messages_received.read().await.deref());
+        error!(
+            "Messages received so far: {}",
+            total_messages_received.read().await.deref()
+        );
     }
 
     let mut total = 0;
