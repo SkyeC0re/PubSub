@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     hash::Hash,
+    marker::PhantomData,
     ops::{AddAssign, Deref, DerefMut},
     sync::{Arc, Weak},
     thread::current,
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tokio::{
     net::{TcpListener, TcpStream},
-    runtime::Runtime,
+    runtime::{Handle, Runtime},
     sync::{Mutex, RwLock},
     time::sleep,
 };
@@ -41,27 +42,30 @@ pub trait Client<M, E>: Send + Sync {
 
 pub struct RegisteredClient<
     K: Hash + Eq + Clone + Send + Sync + 'static,
-    M: Send + Sync + Clone + 'static,
-    E: 'static,
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
 > {
     id: K,
-    client: Arc<dyn Client<M, E>>,
-    topic_tree: TopicTree<K, TaggedClient<M, E>>,
+    client: Arc<C>,
+    topic_tree: TopicTree<K, TaggedClient<C, M, E>>,
     subscribed_topics: Arc<RwLock<HashSet<TopicSpecifier>>>,
     tags: Arc<RwLock<HashSet<String>>>,
-    runtime: Arc<Runtime>,
+    runtime_handle: Handle,
 }
 
-impl<K, M, E> Drop for RegisteredClient<K, M, E>
+impl<K, C, M, E> Drop for RegisteredClient<K, C, M, E>
 where
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
     K: Hash + Eq + Clone + Send + Sync + 'static,
-    M: Send + Sync + Clone + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
 {
     fn drop(&mut self) {
         let topic_tree = self.topic_tree.clone();
         let subscribed_topics = self.subscribed_topics.clone();
         let id = self.id.clone();
-        self.runtime.spawn(async move {
+        self.runtime_handle.spawn(async move {
             for topic in subscribed_topics.read().await.deref() {
                 topic_tree.unsubscribe_from_topic(&id, topic).await;
             }
@@ -69,33 +73,67 @@ where
     }
 }
 
-struct TaggedClient<M, E> {
-    client: Arc<dyn Client<M, E>>,
-    tags: Arc<RwLock<HashSet<String>>>,
-}
-
-impl<M, E> Deref for TaggedClient<M, E> {
-    type Target = dyn Client<M, E>;
+impl<K, C, M, E> Deref for RegisteredClient<K, C, M, E>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    type Target = C;
 
     fn deref(&self) -> &Self::Target {
         self.client.as_ref()
     }
 }
 
-impl<M, E> Clone for TaggedClient<M, E> {
+pub struct TaggedClient<C, M, E>
+where
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    client: Arc<C>,
+    tags: Arc<RwLock<HashSet<String>>>,
+    _message_type: PhantomData<&'static M>,
+    _error_type: PhantomData<&'static E>,
+}
+
+impl<C, M, E> Deref for TaggedClient<C, M, E>
+where
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    type Target = C;
+
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref()
+    }
+}
+
+impl<C, M, E> Clone for TaggedClient<C, M, E>
+where
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
             tags: self.tags.clone(),
+            _message_type: PhantomData,
+            _error_type: PhantomData,
         }
     }
 }
 
-impl<K, M, E> RegisteredClient<K, M, E>
+impl<K, C, M, E> RegisteredClient<K, C, M, E>
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
-    M: Send + Sync + Clone + 'static,
-    E: Error + 'static,
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
 {
     pub async fn subscribe_to_topic(&self, topic: &TopicSpecifier) {
         if self.subscribed_topics.write().await.insert(topic.clone()) {
@@ -121,10 +159,12 @@ where
         }
     }
 
-    fn get_tagged_client(&self) -> TaggedClient<M, E> {
+    fn get_tagged_client(&self) -> TaggedClient<C, M, E> {
         TaggedClient {
             client: self.client.clone(),
             tags: self.tags.clone(),
+            _message_type: PhantomData,
+            _error_type: PhantomData,
         }
     }
 }
@@ -173,9 +213,16 @@ impl<K, V> TopicNode<K, V> {
     }
 }
 
-#[derive(Clone)]
 pub struct TopicTree<K, V> {
     tree: TopicTreeNode<K, V>,
+}
+
+impl<K, V> Clone for TopicTree<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            tree: self.tree.clone(),
+        }
+    }
 }
 
 impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'static>
@@ -406,32 +453,39 @@ pub struct DynamicManagerConfig {
     pub prune_delay_secs: usize,
 }
 
-pub struct DynamicManager<K, M, E> {
-    topic_tree: TopicTree<K, TaggedClient<M, E>>,
+pub struct DynamicManager<K, C, M = (), E = ()>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    topic_tree: TopicTree<K, TaggedClient<C, M, E>>,
     config: DynamicManagerConfig,
-    runtime: Arc<Runtime>,
+    runtime_handle: Handle,
     next_id: RwLock<UniqId>,
 }
 
-impl<M, E> DynamicManager<UniqId, M, E>
+impl<C, M, E> DynamicManager<UniqId, C, M, E>
 where
-    M: Send + Sync + Clone + 'static,
-    E: Error + Clone + 'static,
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
 {
-    pub fn new(runtime: Arc<Runtime>) -> Self {
+    pub fn new(runtime_handle: Handle) -> Self {
         Self {
             topic_tree: TopicTree::new(),
             config: DynamicManagerConfig::default(),
-            runtime,
+            runtime_handle,
             next_id: Default::default(),
         }
     }
 
-    pub fn new_with_config(runtime: Arc<Runtime>, config: DynamicManagerConfig) -> Self {
+    pub fn new_with_config(runtime_handle: Handle, config: DynamicManagerConfig) -> Self {
         Self {
             topic_tree: TopicTree::new(),
             config,
-            runtime,
+            runtime_handle,
             next_id: Default::default(),
         }
     }
@@ -439,7 +493,7 @@ where
     pub async fn find_subscribed_clients(
         &self,
         topics: impl IntoIterator<Item = &TopicSpecifier>,
-    ) -> HashMap<UniqId, TaggedClient<M, E>> {
+    ) -> HashMap<UniqId, TaggedClient<C, M, E>> {
         let mut candidate_set = HashMap::new();
         for topic in topics {
             self.topic_tree
@@ -453,20 +507,17 @@ where
         &self,
         topics: impl IntoIterator<Item = &TopicSpecifier>,
         message: M,
-    ) -> HashMap<UniqId, TaggedClient<M, E>> {
+    ) -> HashMap<UniqId, TaggedClient<C, M, E>> {
         let candidates = self.find_subscribed_clients(topics).await;
         for candidate in candidates.values() {
-            if let Err(e) = candidate.send_message(&message).await {
-                error!("Error sending message to client: {:?}", e);
+            if let Err(_) = candidate.send_message(&message).await {
+                error!("Error sending message to client");
             };
         }
         candidates
     }
 
-    pub async fn register_client(
-        &self,
-        client: Arc<dyn Client<M, E>>,
-    ) -> RegisteredClient<UniqId, M, E> {
+    pub async fn register_client(&self, client: Arc<C>) -> RegisteredClient<UniqId, C, M, E> {
         let mut id_write_guard = self.next_id.write().await;
         let id = id_write_guard.clone();
         id_write_guard.add_assign(&1);
@@ -477,197 +528,197 @@ where
             topic_tree: self.topic_tree.clone(),
             subscribed_topics: Default::default(),
             tags: Default::default(),
-            runtime: self.runtime.clone(),
+            runtime_handle: self.runtime_handle.clone(),
         }
     }
 }
 
-pub struct WebSocketManager<F> {
-    next_id: Mutex<UniqId>,
-    topic_tree: TopicTree<UniqId, WebSocketClient>,
-    client_message_callback: Arc<F>,
-    tcp_runtime: Runtime,
-    client_runtime: Runtime,
-}
+// pub struct WebSocketManager<F> {
+//     next_id: Mutex<UniqId>,
+//     topic_tree: TopicTree<UniqId, WebSocketClient>,
+//     client_message_callback: Arc<F>,
+//     tcp_runtime: Runtime,
+//     client_runtime: Runtime,
+// }
 
-impl<F> WebSocketManager<F>
-where
-    F: ClientCallback<WebSocketClient, UniqId, Message, tokio_tungstenite::tungstenite::Error>
-        + Send
-        + Sync
-        + 'static,
-{
-    pub async fn next_id(&self) -> UniqId {
-        let mut next_id = self.next_id.lock().await;
-        let id = next_id.clone();
-        next_id.add_assign(&1);
-        id
-    }
+// impl<F> WebSocketManager<F>
+// where
+//     F: ClientCallback<WebSocketClient, UniqId, Message, tokio_tungstenite::tungstenite::Error>
+//         + Send
+//         + Sync
+//         + 'static,
+// {
+//     pub async fn next_id(&self) -> UniqId {
+//         let mut next_id = self.next_id.lock().await;
+//         let id = next_id.clone();
+//         next_id.add_assign(&1);
+//         id
+//     }
 
-    pub async fn new(
-        client_message_callback: F,
-    ) -> Result<Arc<Self>, tokio_tungstenite::tungstenite::Error> {
-        let tcp_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(3)
-            .build()?;
+//     pub async fn new(
+//         client_message_callback: F,
+//     ) -> Result<Arc<Self>, tokio_tungstenite::tungstenite::Error> {
+//         let tcp_runtime = tokio::runtime::Builder::new_multi_thread()
+//             .enable_all()
+//             .worker_threads(3)
+//             .build()?;
 
-        let client_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(8)
-            .build()?;
+//         let client_runtime = tokio::runtime::Builder::new_multi_thread()
+//             .enable_all()
+//             .worker_threads(8)
+//             .build()?;
 
-        let manager = Self {
-            topic_tree: TopicTree::new(),
-            client_message_callback: Arc::new(client_message_callback),
-            tcp_runtime,
-            client_runtime,
-            next_id: Mutex::default(),
-        };
-        info!("Creating Manager");
+//         let manager = Self {
+//             topic_tree: TopicTree::new(),
+//             client_message_callback: Arc::new(client_message_callback),
+//             tcp_runtime,
+//             client_runtime,
+//             next_id: Mutex::default(),
+//         };
+//         info!("Creating Manager");
 
-        let locked_manager = Arc::new(manager);
-        Ok(locked_manager)
-    }
+//         let locked_manager = Arc::new(manager);
+//         Ok(locked_manager)
+//     }
 
-    pub async fn add_listener(manager: &Arc<Self>, listener: TcpListener) {
-        let manager_clone = manager.clone();
-        manager.tcp_runtime.spawn(async move {
-            while let Ok((stream, addr)) = listener.accept().await {
-                let ws = match accept_async(stream).await {
-                    Ok(ws) => ws,
-                    Err(_) => {
-                        warn!("Invalid websocket handshake from: {}", addr);
-                        continue;
-                    }
-                };
+//     pub async fn add_listener(manager: &Arc<Self>, listener: TcpListener) {
+//         let manager_clone = manager.clone();
+//         manager.tcp_runtime.spawn(async move {
+//             while let Ok((stream, addr)) = listener.accept().await {
+//                 let ws = match accept_async(stream).await {
+//                     Ok(ws) => ws,
+//                     Err(_) => {
+//                         warn!("Invalid websocket handshake from: {}", addr);
+//                         continue;
+//                     }
+//                 };
 
-                manager_clone.insert_new_client(ws).await;
-            }
-        });
-    }
-    /// Find all websockets that are authorized to receive a message.
-    pub async fn find_authorized_clients(
-        topic_tree: &TopicTree<UniqId, WebSocketClient>,
-        topics: impl IntoIterator<Item = &TopicSpecifier>,
-    ) -> HashMap<UniqId, WebSocketClient> {
-        let mut candidate_set = HashMap::new();
-        for topic in topics {
-            topic_tree.find_subscribers(topic, &mut candidate_set).await;
-        }
-        candidate_set
-    }
+//                 manager_clone.insert_new_client(ws).await;
+//             }
+//         });
+//     }
+//     /// Find all websockets that are authorized to receive a message.
+//     pub async fn find_authorized_clients(
+//         topic_tree: &TopicTree<UniqId, WebSocketClient>,
+//         topics: impl IntoIterator<Item = &TopicSpecifier>,
+//     ) -> HashMap<UniqId, WebSocketClient> {
+//         let mut candidate_set = HashMap::new();
+//         for topic in topics {
+//             topic_tree.find_subscribers(topic, &mut candidate_set).await;
+//         }
+//         candidate_set
+//     }
 
-    pub async fn insert_new_client(&self, ws: WebSocketStream<Stream>) {
-        let id = self.next_id().await;
+//     pub async fn insert_new_client(&self, ws: WebSocketStream<Stream>) {
+//         let id = self.next_id().await;
 
-        let (ws_send, ws_recv) = ws.split();
-        let ws_client = WebSocketClient {
-            inner: Arc::new(WebSocketClientInner {
-                id,
-                ws_send: Mutex::new(ws_send),
-                topic_tree: self.topic_tree.clone(),
-                subscribed_topics: RwLock::default(),
-            }),
-        };
+//         let (ws_send, ws_recv) = ws.split();
+//         let ws_client = WebSocketClient {
+//             inner: Arc::new(WebSocketClientInner {
+//                 id,
+//                 ws_send: Mutex::new(ws_send),
+//                 topic_tree: self.topic_tree.clone(),
+//                 subscribed_topics: RwLock::default(),
+//             }),
+//         };
 
-        let callback_function = self.client_message_callback.clone();
-        let ws_client = Arc::new(RwLock::new(ws_client));
+//         let callback_function = self.client_message_callback.clone();
+//         let ws_client = Arc::new(RwLock::new(ws_client));
 
-        // Client listener
-        self.client_runtime.spawn(async move {
-            ws_recv
-                .for_each(|res| async {
-                    let message = match res {
-                        Ok(message) => message,
-                        Err(e) => {
-                            warn!("Invalid message from client {:?}", e);
-                            return;
-                        }
-                    };
+//         // Client listener
+//         self.client_runtime.spawn(async move {
+//             ws_recv
+//                 .for_each(|res| async {
+//                     let message = match res {
+//                         Ok(message) => message,
+//                         Err(e) => {
+//                             warn!("Invalid message from client {:?}", e);
+//                             return;
+//                         }
+//                     };
 
-                    let read_guard = ws_client.read().await;
+//                     let read_guard = ws_client.read().await;
 
-                    callback_function
-                        .callback(read_guard.deref(), message)
-                        .await;
-                })
-                .await;
+//                     callback_function
+//                         .callback(read_guard.deref(), message)
+//                         .await;
+//                 })
+//                 .await;
 
-            ws_client.read().await.kill_client().await;
-        });
-    }
+//             ws_client.read().await.kill_client().await;
+//         });
+//     }
 
-    pub fn send_message(&self, topics: Vec<TopicSpecifier>, message: Message) {
-        let topic_tree = self.topic_tree.clone();
-        self.client_runtime.spawn(async move {
-            let candidates = Self::find_authorized_clients(&topic_tree, &topics).await;
-            for candidate in candidates.into_values() {
-                if let Err(e) = candidate.send_message(&message).await {
-                    error!("Error sending message to client: {:?}", e);
-                };
-            }
-        });
-    }
-}
+//     pub fn send_message(&self, topics: Vec<TopicSpecifier>, message: Message) {
+//         let topic_tree = self.topic_tree.clone();
+//         self.client_runtime.spawn(async move {
+//             let candidates = Self::find_authorized_clients(&topic_tree, &topics).await;
+//             for candidate in candidates.into_values() {
+//                 if let Err(e) = candidate.send_message(&message).await {
+//                     error!("Error sending message to client: {:?}", e);
+//                 };
+//             }
+//         });
+//     }
+// }
 
-#[derive(Clone)]
-pub struct WebSocketClient {
-    inner: Arc<WebSocketClientInner>,
-}
+// #[derive(Clone)]
+// pub struct WebSocketClient {
+//     inner: Arc<WebSocketClientInner>,
+// }
 
-#[async_trait]
-impl Client<Message, tokio_tungstenite::tungstenite::Error> for WebSocketClient {
-    async fn send_message(
-        &self,
-        message: &Message,
-    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        self.send_message(message).await
-    }
-}
+// #[async_trait]
+// impl Client<Message, tokio_tungstenite::tungstenite::Error> for WebSocketClient {
+//     async fn send_message(
+//         &self,
+//         message: &Message,
+//     ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+//         self.send_message(message).await
+//     }
+// }
 
-impl Deref for WebSocketClient {
-    type Target = WebSocketClientInner;
+// impl Deref for WebSocketClient {
+//     type Target = WebSocketClientInner;
 
-    fn deref(&self) -> &Self::Target {
-        self.inner.as_ref()
-    }
-}
+//     fn deref(&self) -> &Self::Target {
+//         self.inner.as_ref()
+//     }
+// }
 
-pub struct WebSocketClientInner {
-    id: UniqId,
-    ws_send: Mutex<SplitSink<WebSocketStream<Stream>, Message>>,
-    topic_tree: TopicTree<UniqId, WebSocketClient>,
-    subscribed_topics: RwLock<HashSet<TopicSpecifier>>,
-}
+// pub struct WebSocketClientInner {
+//     id: UniqId,
+//     ws_send: Mutex<SplitSink<WebSocketStream<Stream>, Message>>,
+//     topic_tree: TopicTree<UniqId, WebSocketClient>,
+//     subscribed_topics: RwLock<HashSet<TopicSpecifier>>,
+// }
 
-impl WebSocketClient {
-    pub async fn subscribe_to_topic(&self, topic: &TopicSpecifier) {
-        self.topic_tree
-            .subscribe_to_topic(self.id, self.clone(), topic)
-            .await;
+// impl WebSocketClient {
+//     pub async fn subscribe_to_topic(&self, topic: &TopicSpecifier) {
+//         self.topic_tree
+//             .subscribe_to_topic(self.id, self.clone(), topic)
+//             .await;
 
-        self.subscribed_topics.write().await.insert(topic.clone());
-    }
+//         self.subscribed_topics.write().await.insert(topic.clone());
+//     }
 
-    pub async fn unsubscribe_from_topic(&self, topic: &TopicSpecifier) {
-        self.topic_tree
-            .unsubscribe_from_topic(&self.id, topic)
-            .await;
-    }
+//     pub async fn unsubscribe_from_topic(&self, topic: &TopicSpecifier) {
+//         self.topic_tree
+//             .unsubscribe_from_topic(&self.id, topic)
+//             .await;
+//     }
 
-    pub async fn send_message(
-        &self,
-        message: &Message,
-    ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        self.ws_send.lock().await.send(message.clone()).await
-    }
+//     pub async fn send_message(
+//         &self,
+//         message: &Message,
+//     ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+//         self.ws_send.lock().await.send(message.clone()).await
+//     }
 
-    pub async fn kill_client(&self) {
-        let mut subscribed_topics_write_guard = self.subscribed_topics.write().await;
-        for topic in subscribed_topics_write_guard.iter() {
-            self.unsubscribe_from_topic(topic).await;
-        }
-        *subscribed_topics_write_guard.deref_mut() = HashSet::new();
-    }
-}
+//     pub async fn kill_client(&self) {
+//         let mut subscribed_topics_write_guard = self.subscribed_topics.write().await;
+//         for topic in subscribed_topics_write_guard.iter() {
+//             self.unsubscribe_from_topic(topic).await;
+//         }
+//         *subscribed_topics_write_guard.deref_mut() = HashSet::new();
+//     }
+// }
