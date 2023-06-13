@@ -16,10 +16,6 @@ use tokio::{runtime::Handle, sync::RwLock, time::sleep};
 pub type UniqId = u128;
 type TopicTreeNode<K, V> = Arc<RwLock<TopicNode<K, V>>>;
 type WeakTopicTreeNode<K, V> = Weak<RwLock<TopicNode<K, V>>>;
-#[async_trait]
-pub trait ClientCallback<C: Client<M, E>, K, M, E> {
-    async fn callback(&self, client: &C, message: M);
-}
 
 #[async_trait]
 pub trait Client<M, E>: Send + Sync {
@@ -73,6 +69,55 @@ where
     }
 }
 
+impl<K, C, M, E> RegisteredClient<K, C, M, E>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    pub async fn subscribe_to_topic(&self, topic: &TopicSpecifier) {
+        if self.subscribed_topics.write().await.insert(topic.clone()) {
+            self.topic_tree
+                .subscribe_to_topic(self.id.clone(), self.get_tagged_client(), topic)
+                .await;
+        };
+    }
+
+    pub async fn unsubscribe_from_topic(&self, topic: &TopicSpecifier) {
+        if self.subscribed_topics.write().await.remove(topic) {
+            self.topic_tree
+                .unsubscribe_from_topic(&self.id, topic)
+                .await;
+        };
+    }
+
+    pub async fn unsubscribe_from_all(&self) {
+        for topic in self.subscribed_topics.write().await.drain() {
+            self.topic_tree
+                .unsubscribe_from_topic(&self.id, &topic)
+                .await;
+        }
+    }
+
+    pub async fn add_tag(&self, tag: String) {
+        self.tags.write().await.insert(tag);
+    }
+
+    pub async fn remove_tag(&self, tag: &str) {
+        self.tags.write().await.remove(tag);
+    }
+
+    fn get_tagged_client(&self) -> TaggedClient<C, M, E> {
+        TaggedClient {
+            client: self.client.clone(),
+            tags: self.tags.clone(),
+            _message_type: PhantomData,
+            _error_type: PhantomData,
+        }
+    }
+}
+
 pub struct TaggedClient<C, M, E>
 where
     C: Client<M, E> + ?Sized + Send + Sync + 'static,
@@ -106,47 +151,6 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            client: self.client.clone(),
-            tags: self.tags.clone(),
-            _message_type: PhantomData,
-            _error_type: PhantomData,
-        }
-    }
-}
-
-impl<K, C, M, E> RegisteredClient<K, C, M, E>
-where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
-    M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
-{
-    pub async fn subscribe_to_topic(&self, topic: &TopicSpecifier) {
-        if self.subscribed_topics.write().await.insert(topic.clone()) {
-            self.topic_tree
-                .subscribe_to_topic(self.id.clone(), self.get_tagged_client(), topic)
-                .await;
-        };
-    }
-
-    pub async fn unsubscribe_from_topic(&self, topic: &TopicSpecifier) {
-        if self.subscribed_topics.write().await.remove(topic) {
-            self.topic_tree
-                .unsubscribe_from_topic(&self.id, topic)
-                .await;
-        };
-    }
-
-    pub async fn unsubscribe_from_all(&self) {
-        for topic in self.subscribed_topics.write().await.drain() {
-            self.topic_tree
-                .unsubscribe_from_topic(&self.id, &topic)
-                .await;
-        }
-    }
-
-    fn get_tagged_client(&self) -> TaggedClient<C, M, E> {
-        TaggedClient {
             client: self.client.clone(),
             tags: self.tags.clone(),
             _message_type: PhantomData,
