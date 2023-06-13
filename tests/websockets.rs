@@ -257,13 +257,18 @@ pub async fn test_multiple_clients() {
 
     let server/* : DynamicManager<_,ExclusiveSink<SplitSink<WebSocketStream<TcpStream>, Message>>,Message, ()>*/ = Arc::new(DynamicManager::new(Handle::current()));
     let listener_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(3)
+        .worker_threads(6)
         .enable_all()
         .build()
         .unwrap();
 
     let listener_port_start_range = 5050;
-    for i in 0..10 {
+
+    let num_listeners = 10u16;
+    let num_clients = 200000;
+    let client_buckets = 30;
+
+    for i in 0..num_listeners {
         let listener = generate_tcp_listener(listener_port_start_range + i).await;
         generate_client_emitter(
             listener_runtime.handle().clone(),
@@ -273,9 +278,7 @@ pub async fn test_multiple_clients() {
         );
     }
 
-    let max_clients_per_port = 25000;
-    let num_clients = 200000;
-    let client_buckets = 30;
+    error!("Listeners spawned");
 
     fn get_topics(pos: i32) -> TopicSpecifiers {
         let topics = (0..=pos)
@@ -292,7 +295,7 @@ pub async fn test_multiple_clients() {
     let join_handles: Vec<_> = (0..num_clients)
         .into_iter()
         .map(|i| {
-            let port = listener_port_start_range + (i / max_clients_per_port) as u16;
+            let port = listener_port_start_range + (i % num_listeners as i32) as u16;
             let topics = get_topics(i % client_buckets);
             let jwt = generate_jwt(&signer, topics);
             tokio::spawn(async move {

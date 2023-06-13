@@ -8,10 +8,15 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use log::error;
 use serde::{Deserialize, Serialize};
 
-use tokio::{runtime::Handle, sync::RwLock, time::sleep};
+use tokio::{
+    runtime::Handle,
+    sync::RwLock,
+    time::{sleep, timeout},
+};
 
 pub type UniqId = u128;
 type TopicTreeNode<K, V> = Arc<RwLock<TopicNode<K, V>>>;
@@ -499,11 +504,15 @@ where
         message: M,
     ) -> HashMap<UniqId, TaggedClient<C, M, E>> {
         let candidates = self.find_subscribed_clients(topics).await;
-        for candidate in candidates.values() {
-            if let Err(_) = candidate.send_message(&message).await {
-                error!("Error sending message to client");
-            };
-        }
+        futures::stream::iter(candidates.values())
+            .for_each_concurrent(Some(10), |candidate| async {
+                match timeout(Duration::from_secs(10), candidate.send_message(&message)).await {
+                    Err(_) => error!("Client timed out during send operation"),
+                    Ok(Err(_)) => error!("Error sending message to client"),
+                    _ => {}
+                };
+            })
+            .await;
         candidates
     }
 
