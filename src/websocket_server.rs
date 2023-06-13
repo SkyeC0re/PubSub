@@ -1,30 +1,19 @@
 use std::{
     collections::{HashMap, HashSet},
-    error::Error,
     hash::Hash,
     marker::PhantomData,
-    ops::{AddAssign, Deref, DerefMut},
+    ops::{AddAssign, Deref},
     sync::{Arc, Weak},
-    thread::current,
     time::Duration,
 };
 
 use async_trait::async_trait;
-use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use futures_util::StreamExt;
 
-use log::{error, info, warn};
+use log::error;
 use serde::{Deserialize, Serialize};
 
-use std::future::Future;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    runtime::{Handle, Runtime},
-    sync::{Mutex, RwLock},
-    time::sleep,
-};
-use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
-
-use crate::models::TopicSpecifiers;
+use tokio::{net::TcpStream, runtime::Handle, sync::RwLock, time::sleep};
 
 pub type UniqId = u128;
 type Stream = TcpStream;

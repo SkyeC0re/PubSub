@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    error,
+    collections::HashMap,
     ops::{AddAssign, Deref},
     sync::Arc,
     time::Duration,
@@ -16,22 +15,20 @@ use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
-    runtime::{Handle, Runtime},
+    runtime::Handle,
     sync::Mutex,
-    task::{spawn_blocking, block_in_place},
+    task::block_in_place,
 };
 use tokio::{
     sync::RwLock,
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
-    accept_async, connect_async, connect_async_with_config,
-    tungstenite::{Error, Message},
-    MaybeTlsStream, WebSocketStream,
+    accept_async, connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
 };
 use ws_man::{
     models::TopicSpecifiers,
-    websocket_server::{Client, ClientCallback, DynamicManager, TopicSpecifier, UniqId},
+    websocket_server::{Client, DynamicManager, TopicSpecifier, UniqId},
 };
 #[derive(Serialize, Deserialize)]
 struct TestMessage {
