@@ -28,7 +28,7 @@ use tokio_tungstenite::{
 };
 use ws_man::{
     models::TopicSpecifiers,
-    websocket_server::{Client, DynamicManager, TopicSpecifier, UniqId},
+    pubsub_manager::{Client, DynamicManager, TopicSpecifier, UniqId},
 };
 #[derive(Serialize, Deserialize)]
 struct TestMessage {

@@ -15,15 +15,18 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
+
 tokio-tungstenite = "*"
 log = "0.4.17"
 serde = { version = "*", features = ['derive'] }
-serde_json = "*"
-bytes = "*"
 futures = "*"
 futures-util = "*"
-jwt = { version = "*", features = ["openssl"] }
 rand = "*"
-openssl = "*"
 env_logger = "*"
 async-trait = "*"
+
+[dev-dependencies]
+openssl = "*"
+jwt = { version = "*", features = ["openssl"] }
+serde_json = "*"
+bytes = "*"

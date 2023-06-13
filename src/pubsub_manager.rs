@@ -8,15 +8,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
-
 use log::error;
 use serde::{Deserialize, Serialize};
 
-use tokio::{net::TcpStream, runtime::Handle, sync::RwLock, time::sleep};
+use tokio::{runtime::Handle, sync::RwLock, time::sleep};
 
 pub type UniqId = u128;
-type Stream = TcpStream;
 type TopicTreeNode<K, V> = Arc<RwLock<TopicNode<K, V>>>;
 type WeakTopicTreeNode<K, V> = Weak<RwLock<TopicNode<K, V>>>;
 #[async_trait]

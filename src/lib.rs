@@ -1,2 +1,2 @@
 pub mod models;
-pub mod websocket_server;
+pub mod pubsub_manager;
