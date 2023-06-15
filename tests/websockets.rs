@@ -255,7 +255,7 @@ pub async fn test_multiple_clients() {
 
     let verifier = Arc::new(verifier);
 
-    let server/* : DynamicManager<_,ExclusiveSink<SplitSink<WebSocketStream<TcpStream>, Message>>,Message, ()>*/ = Arc::new(DynamicManager::new(Handle::current()));
+    let server = Arc::new(DynamicManager::new(Handle::current()));
     let listener_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(6)
         .enable_all()
@@ -341,7 +341,6 @@ pub async fn test_multiple_clients() {
         if let Ok(Ok(join_handle)) = join_handle.await {
             clients.push(join_handle);
         }
-        // clients.push(join_handle.await.unwrap().unwrap());
     }
 
     error!(

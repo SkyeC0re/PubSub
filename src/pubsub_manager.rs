@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use log::error;
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 
 use tokio::{
@@ -208,7 +208,20 @@ impl<K, V> TopicNode<K, V> {
     }
 }
 
+pub struct TopicTreeConfig {
+    prune_delay_ms: u64,
+}
+
+impl Default for TopicTreeConfig {
+    fn default() -> Self {
+        Self {
+            prune_delay_ms: 5000,
+        }
+    }
+}
+
 pub struct TopicTree<K, V> {
+    config: Arc<TopicTreeConfig>,
     tree: TopicTreeNode<K, V>,
 }
 
@@ -216,6 +229,7 @@ impl<K, V> Clone for TopicTree<K, V> {
     fn clone(&self) -> Self {
         Self {
             tree: self.tree.clone(),
+            config: self.config.clone(),
         }
     }
 }
@@ -226,6 +240,7 @@ impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'sta
     pub fn new() -> Self {
         Self {
             tree: Arc::new(RwLock::new(TopicNode::new())),
+            config: Arc::default(),
         }
     }
 
@@ -396,8 +411,9 @@ impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'sta
         }
 
         if marked_for_pruning {
+            let delay = self.config.prune_delay_ms;
             tokio::spawn(async move {
-                sleep(Duration::from_secs(10)).await;
+                sleep(Duration::from_millis(delay)).await;
                 TopicTree::prune_leaf(current_branch).await;
             });
         }
@@ -443,9 +459,22 @@ impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'sta
     }
 }
 
-#[derive(Default)]
 pub struct DynamicManagerConfig {
-    pub prune_delay_secs: usize,
+    pub prune_delay_ms: u64,
+    pub message_concurrency: Option<usize>,
+    pub client_send_message_timeout_ms: u64,
+    pub client_send_message_max_attempts: usize,
+}
+
+impl Default for DynamicManagerConfig {
+    fn default() -> Self {
+        Self {
+            prune_delay_ms: 5000,
+            message_concurrency: None,
+            client_send_message_timeout_ms: 5000,
+            client_send_message_max_attempts: 3,
+        }
+    }
 }
 
 pub struct DynamicManager<K, C, M = (), E = ()>
@@ -505,12 +534,19 @@ where
     ) -> HashMap<UniqId, TaggedClient<C, M, E>> {
         let candidates = self.find_subscribed_clients(topics).await;
         futures::stream::iter(candidates.values())
-            .for_each_concurrent(Some(10), |candidate| async {
-                match timeout(Duration::from_secs(10), candidate.send_message(&message)).await {
-                    Err(_) => error!("Client timed out during send operation"),
-                    Ok(Err(_)) => error!("Error sending message to client"),
-                    _ => {}
-                };
+            .for_each_concurrent(self.config.message_concurrency, |candidate| async {
+                for _ in 0..self.config.client_send_message_max_attempts {
+                    match timeout(
+                        Duration::from_millis(self.config.client_send_message_timeout_ms),
+                        candidate.send_message(&message),
+                    )
+                    .await
+                    {
+                        Err(_) => warn!("Client timed out during send operation"),
+                        Ok(Err(_)) => warn!("Error sending message to client"),
+                        Ok(Ok(())) => break,
+                    };
+                }
             })
             .await;
         candidates
