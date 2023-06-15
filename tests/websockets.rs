@@ -28,7 +28,7 @@ use tokio_tungstenite::{
 };
 use ws_man::{
     models::TopicSpecifiers,
-    pubsub_manager::{Client, DynamicManager, TopicSpecifier, UniqId},
+    pubsub_manager::{Client, Manager, TopicSpecifier, UniqId},
 };
 #[derive(Serialize, Deserialize)]
 struct TestMessage {
@@ -103,7 +103,7 @@ impl<T: Sink<Message> + Send + Sync + Unpin> Client<Message, ()> for ExclusiveSi
 fn generate_client_emitter(
     runtime_handle: Handle,
     server: Arc<
-        DynamicManager<
+        Manager<
             UniqId,
             ExclusiveSink<SplitSink<WebSocketStream<TcpStream>, Message>>,
             //ExclusiveSink<impl Sink<Message> + Send + Sync + Unpin>,
@@ -156,7 +156,7 @@ pub async fn test_client_add_and_message() {
 
     let handle = Handle::current();
 
-    let server = Arc::new(DynamicManager::new(handle.clone()));
+    let server = Arc::new(Manager::new(handle.clone()));
 
     let server_clone = server.clone();
     let listener = generate_tcp_listener(PORT).await;
@@ -255,7 +255,7 @@ pub async fn test_multiple_clients() {
 
     let verifier = Arc::new(verifier);
 
-    let server = Arc::new(DynamicManager::new(Handle::current()));
+    let server = Arc::new(Manager::new(Handle::current()));
     let listener_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(6)
         .enable_all()

@@ -221,8 +221,8 @@ impl Default for TopicTreeConfig {
 }
 
 pub struct TopicTree<K, V> {
-    config: Arc<TopicTreeConfig>,
     tree: TopicTreeNode<K, V>,
+    config: Arc<TopicTreeConfig>,
 }
 
 impl<K, V> Clone for TopicTree<K, V> {
@@ -241,6 +241,13 @@ impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'sta
         Self {
             tree: Arc::new(RwLock::new(TopicNode::new())),
             config: Arc::default(),
+        }
+    }
+
+    pub fn new_with_config(config: TopicTreeConfig) -> Self {
+        Self {
+            tree: Arc::new(RwLock::new(TopicNode::new())),
+            config: Arc::new(config),
         }
     }
 
@@ -459,14 +466,14 @@ impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'sta
     }
 }
 
-pub struct DynamicManagerConfig {
+pub struct ManagerConfig {
     pub prune_delay_ms: u64,
     pub message_concurrency: Option<usize>,
     pub client_send_message_timeout_ms: u64,
     pub client_send_message_max_attempts: usize,
 }
 
-impl Default for DynamicManagerConfig {
+impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
             prune_delay_ms: 5000,
@@ -477,7 +484,7 @@ impl Default for DynamicManagerConfig {
     }
 }
 
-pub struct DynamicManager<K, C, M = (), E = ()>
+pub struct Manager<K, C, M = (), E = ()>
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     C: Client<M, E> + ?Sized + Send + Sync + 'static,
@@ -485,35 +492,35 @@ where
     E: Send + Sync + 'static,
 {
     topic_tree: TopicTree<K, TaggedClient<C, M, E>>,
-    config: DynamicManagerConfig,
+    config: ManagerConfig,
     runtime_handle: Handle,
     next_id: RwLock<UniqId>,
 }
 
-impl<C, M, E> DynamicManager<UniqId, C, M, E>
+impl<C, M, E> Manager<UniqId, C, M, E>
 where
     C: Client<M, E> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
     E: Send + Sync + 'static,
 {
+    /// Creates a new message manager using a handle to the runtime used for internal actions and with the default config.
     pub fn new(runtime_handle: Handle) -> Self {
-        Self {
-            topic_tree: TopicTree::new(),
-            config: DynamicManagerConfig::default(),
-            runtime_handle,
-            next_id: Default::default(),
-        }
+        Self::new_with_config(runtime_handle, Default::default())
     }
 
-    pub fn new_with_config(runtime_handle: Handle, config: DynamicManagerConfig) -> Self {
+    /// Creates a new message manager using a handle to the runtime used for internal actions and with the given config.
+    pub fn new_with_config(runtime_handle: Handle, config: ManagerConfig) -> Self {
         Self {
-            topic_tree: TopicTree::new(),
+            topic_tree: TopicTree::new_with_config(TopicTreeConfig {
+                prune_delay_ms: config.prune_delay_ms,
+            }),
             config,
             runtime_handle,
             next_id: Default::default(),
         }
     }
 
+    /// Find all the subscribed clients present in the given list of topics.
     pub async fn find_subscribed_clients(
         &self,
         topics: impl IntoIterator<Item = &TopicSpecifier>,
@@ -527,6 +534,7 @@ where
         candidate_set
     }
 
+    /// Sends a message to the all clients in the given list of topics and returns the involved clients.
     pub async fn send_message(
         &self,
         topics: impl IntoIterator<Item = &TopicSpecifier>,
@@ -552,6 +560,7 @@ where
         candidates
     }
 
+    /// Registers a client on the manager, granting it a unique id.
     pub async fn register_client(&self, client: Arc<C>) -> RegisteredClient<UniqId, C, M, E> {
         let mut id_write_guard = self.next_id.write().await;
         let id = id_write_guard.clone();
