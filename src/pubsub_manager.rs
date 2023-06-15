@@ -423,20 +423,16 @@ impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'sta
         loop {
             match current_topic {
                 TopicSpecifier::Wildcard => {
-                    let current_branch_write_guard = current_branch.write().await;
-                    current_branch
-                        .write()
-                        .await
+                    let mut current_branch_write_guard = current_branch.write().await;
+                    current_branch_write_guard
                         .wildcard_subtopic_subscribers
                         .remove(client_id);
                     marked_for_pruning = current_branch_write_guard.is_empty_leaf();
                     break;
                 }
                 TopicSpecifier::ThisTopic => {
-                    let current_branch_write_guard = current_branch.write().await;
-                    current_branch
-                        .write()
-                        .await
+                    let mut current_branch_write_guard = current_branch.write().await;
+                    current_branch_write_guard
                         .topic_subscribers
                         .remove(client_id);
                     marked_for_pruning = current_branch_write_guard.is_empty_leaf();
@@ -444,12 +440,8 @@ impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'sta
                 }
                 TopicSpecifier::Subtopic { topic, specifier } => {
                     current_topic = specifier;
-                    let current_branch_read_guard = current_branch.read().await;
-
-                    if let Some(subtopic_tree) =
-                        current_branch_read_guard.subtopics.get(topic).cloned()
-                    {
-                        drop(current_branch_read_guard);
+                    let subtopic_tree = current_branch.read().await.subtopics.get(topic).cloned();
+                    if let Some(subtopic_tree) = subtopic_tree {
                         current_branch = subtopic_tree;
                     } else {
                         // Nothing to do, client was never on that topic
