@@ -26,7 +26,7 @@ use tokio::{
 use tokio_tungstenite::{
     accept_async, connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
 };
-use ws_man::{
+use pubsub::{
     models::TopicSpecifiers,
     pubsub_manager::{Client, Manager, TopicSpecifier, UniqId},
 };

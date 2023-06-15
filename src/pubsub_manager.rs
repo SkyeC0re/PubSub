@@ -179,6 +179,48 @@ pub enum TopicSpecifier {
     },
 }
 
+impl TopicSpecifier {
+    pub fn build() -> TopicSpecifierBuilder {
+        TopicSpecifierBuilder::new()
+    }
+}
+
+#[derive(Default)]
+pub struct TopicSpecifierBuilder {
+    topics: Vec<String>,
+}
+
+impl TopicSpecifierBuilder {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn subtopic<T: Into<String>>(mut self, subtopic: T) -> Self {
+        self.topics.push(subtopic.into());
+        self
+    }
+
+    pub fn this_topic(self) -> TopicSpecifier {
+        self.terminate(TopicSpecifier::ThisTopic)
+    }
+
+    pub fn all(self) -> TopicSpecifier {
+        self.terminate(TopicSpecifier::Wildcard)
+    }
+
+    pub fn terminate(self, terminator: TopicSpecifier) -> TopicSpecifier {
+        self.topics
+            .into_iter()
+            .rev()
+            .fold(terminator, |tail, topic| TopicSpecifier::Subtopic {
+                topic,
+                specifier: Box::new(tail),
+            })
+    }
+}
+
+impl TopicSpecifier {}
+
 #[derive(Default)]
 struct TopicNode<K, V> {
     topic_subscribers: HashMap<K, V>,
