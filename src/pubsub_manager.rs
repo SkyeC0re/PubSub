@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use tokio::{
     runtime::Handle,
-    sync::RwLock,
+    sync::{Mutex, RwLock},
     time::{sleep, timeout},
 };
 
@@ -25,6 +25,23 @@ type WeakTopicTreeNode<K, V> = Weak<RwLock<TopicNode<K, V>>>;
 #[async_trait]
 pub trait Client<M, E>: Send + Sync {
     async fn send_message(&self, message: &M) -> Result<(), E>;
+}
+
+#[async_trait]
+pub trait MutableClient<M, E>: Send + Sync {
+    async fn send_message(&mut self, message: &M) -> Result<(), E>;
+}
+
+#[async_trait]
+impl<C, M, E> Client<M, E> for Mutex<C>
+where
+    C: MutableClient<M, E> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    async fn send_message(&self, message: &M) -> Result<(), E> {
+        self.lock().await.send_message(message).await
+    }
 }
 
 pub struct RegisteredClient<
@@ -608,5 +625,30 @@ where
             tags: Default::default(),
             runtime_handle: self.runtime_handle.clone(),
         }
+    }
+}
+
+impl<C, M, E> Manager<UniqId, C, M, E>
+where
+    C: Client<M, E> + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    pub async fn register_raw_client(&self, client: C) -> RegisteredClient<UniqId, C, M, E> {
+        self.register_client(Arc::new(client)).await
+    }
+}
+
+impl<C, M, E> Manager<UniqId, Mutex<C>, M, E>
+where
+    C: MutableClient<M, E> + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    pub async fn register_raw_mutable_client(
+        &self,
+        client: C,
+    ) -> RegisteredClient<UniqId, Mutex<C>, M, E> {
+        self.register_client(Arc::new(Mutex::new(client))).await
     }
 }
