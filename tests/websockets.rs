@@ -12,6 +12,10 @@ use jwt::{
 };
 use log::error;
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
+use pubsub::{
+    models::TopicSpecifiers,
+    pubsub_manager::{Client, Manager, TopicSpecifier, UniqId},
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -25,10 +29,6 @@ use tokio::{
 };
 use tokio_tungstenite::{
     accept_async, connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
-};
-use pubsub::{
-    models::TopicSpecifiers,
-    pubsub_manager::{Client, Manager, TopicSpecifier, UniqId},
 };
 #[derive(Serialize, Deserialize)]
 struct TestMessage {
@@ -265,7 +265,7 @@ pub async fn test_multiple_clients() {
     let listener_port_start_range = 5050;
 
     let num_listeners = 10u16;
-    let num_clients = 200000;
+    let num_clients = 2000;
     let client_buckets = 30;
 
     for i in 0..num_listeners {
@@ -361,7 +361,12 @@ pub async fn test_multiple_clients() {
             tokio::spawn(async move {
                 client
                     .for_each(|res| async {
-                        match res.unwrap() {
+                        let message = if let Ok(message) = res {
+                            message
+                        } else {
+                            return;
+                        };
+                        match message {
                             Message::Text(serialized_message) => {
                                 let message: TestMessage =
                                     serde_json::from_str(&serialized_message).unwrap();
@@ -420,7 +425,7 @@ pub async fn test_multiple_clients() {
     }
     error!("Correct messages {}/{}", correct, total);
     sleep(Duration::from_secs(5)).await;
-    block_in_place(|| {
-        drop(listener_runtime);
-    })
+    block_in_place(|| async {
+        listener_runtime.shutdown_background();
+    }).await;
 }

@@ -3,12 +3,17 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     ops::{AddAssign, Deref},
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex as BlockingMutex, Weak},
     time::Duration,
 };
 
+use itertools::Itertools;
+
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{
+    stream::{futures_unordered, FuturesUnordered},
+    StreamExt,
+};
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 
@@ -590,25 +595,104 @@ where
         &self,
         topics: impl IntoIterator<Item = &TopicSpecifier>,
         message: M,
-    ) -> HashMap<UniqId, TaggedClient<C, M, E>> {
+    ) {
         let candidates = self.find_subscribed_clients(topics).await;
-        futures::stream::iter(candidates.values())
-            .for_each_concurrent(self.config.message_concurrency, |candidate| async {
-                for _ in 0..self.config.client_send_message_max_attempts {
-                    match timeout(
-                        Duration::from_millis(self.config.client_send_message_timeout_ms),
-                        candidate.send_message(&message),
-                    )
-                    .await
-                    {
-                        Err(_) => warn!("Client timed out during send operation"),
-                        Ok(Err(_)) => warn!("Error sending message to client"),
-                        Ok(Ok(())) => break,
-                    };
+        let message = Arc::new(message);
+        let send_message_max_attempts = self.config.client_send_message_max_attempts;
+        let send_message_max_timeout_ms = self.config.client_send_message_timeout_ms;
+
+        let send_message_chunk = |chunk: Vec<TaggedClient<C, M, E>>, message: Arc<M>| async {
+            let result = tokio::spawn(async move {
+                futures::stream::iter(&chunk)
+                    .for_each_concurrent(None, |candidate| async {
+                        for _ in 0..send_message_max_attempts {
+                            match timeout(
+                                Duration::from_millis(send_message_max_timeout_ms),
+                                candidate.send_message(&message),
+                            )
+                            .await
+                            {
+                                Err(_) => warn!("Client timed out during send operation"),
+                                Ok(Err(_)) => warn!("Error sending message to client"),
+                                Ok(Ok(())) => return,
+                            };
+                        }
+                    })
+                    .await;
+            })
+            .await;
+
+            result
+        };
+
+        futures::stream::iter(candidates.into_values())
+            .chunks(10)
+            .for_each_concurrent(None, |chunk| async {
+                if send_message_chunk(chunk, message.clone()).await.is_err() {
+                    error!("Message chunk join failure");
                 }
             })
             .await;
-        candidates
+    }
+
+    pub async fn send_message_and_record_tags(
+        &self,
+        topics: impl IntoIterator<Item = &TopicSpecifier>,
+        message: M,
+    ) -> HashSet<String> {
+        let candidates = self.find_subscribed_clients(topics).await;
+        let message = Arc::new(message);
+        let mut recorded_tags = HashSet::new();
+        let send_message_max_attempts = self.config.client_send_message_max_attempts;
+        let send_message_max_timeout_ms = self.config.client_send_message_timeout_ms;
+
+        let send_message_chunk = |chunk: Vec<TaggedClient<C, M, E>>, message: Arc<M>| async {
+            let result = tokio::spawn(async move {
+                let recorded_tags = Mutex::new(HashSet::new());
+                futures::stream::iter(&chunk)
+                    .for_each_concurrent(None, |candidate| async {
+                        for _ in 0..send_message_max_attempts {
+                            match timeout(
+                                Duration::from_millis(send_message_max_timeout_ms),
+                                candidate.send_message(&message),
+                            )
+                            .await
+                            {
+                                Err(_) => warn!("Client timed out during send operation"),
+                                Ok(Err(_)) => warn!("Error sending message to client"),
+                                Ok(Ok(())) => {
+                                    recorded_tags.lock().await.extend(
+                                        candidate.tags.read().await.deref().iter().cloned(),
+                                    );
+                                    return;
+                                }
+                            };
+                        }
+                    })
+                    .await;
+                recorded_tags.into_inner()
+            })
+            .await;
+
+            result
+        };
+
+        let mut chunks_tags = candidates
+            .into_values()
+            .chunks(10)
+            .into_iter()
+            .map(|chunk| chunk.into_iter().collect_vec())
+            .map(|chunk| send_message_chunk(chunk, message.clone()))
+            .collect::<FuturesUnordered<_>>();
+
+        while let Some(chunk_tags) = chunks_tags.next().await {
+            match chunk_tags {
+                Ok(tags) => recorded_tags.extend(tags),
+                Err(_) => error!("Message chunk join failure"),
+            }
+        }
+
+        recorded_tags
     }
 
     /// Registers a client on the manager, granting it a unique id.

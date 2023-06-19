@@ -24,6 +24,7 @@ futures-util = "*"
 rand = "*"
 env_logger = "*"
 async-trait = "*"
+itertools = "*"
 
 [dev-dependencies]
 openssl = "*"
