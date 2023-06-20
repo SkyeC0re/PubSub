@@ -265,7 +265,7 @@ pub async fn test_multiple_clients() {
     let listener_port_start_range = 5050;
 
     let num_listeners = 10u16;
-    let num_clients = 2000;
+    let num_clients = 20000;
     let client_buckets = 30;
 
     for i in 0..num_listeners {
