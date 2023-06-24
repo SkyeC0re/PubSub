@@ -523,9 +523,10 @@ impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'sta
     }
 }
 
+#[derive(Clone)]
 pub struct ManagerConfig {
     pub prune_delay_ms: u64,
-    pub message_concurrency: Option<usize>,
+    pub send_message_parallel_chunks_size: usize,
     pub client_send_message_timeout_ms: u64,
     pub client_send_message_max_attempts: usize,
 }
@@ -534,7 +535,7 @@ impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
             prune_delay_ms: 5000,
-            message_concurrency: None,
+            send_message_parallel_chunks_size: 100,
             client_send_message_timeout_ms: 5000,
             client_send_message_max_attempts: 3,
         }
@@ -549,7 +550,7 @@ where
     E: Send + Sync + 'static,
 {
     topic_tree: TopicTree<K, TaggedClient<C, M, E>>,
-    config: ManagerConfig,
+    config: Arc<ManagerConfig>,
     runtime_handle: Handle,
     next_id: RwLock<UniqId>,
 }
@@ -571,7 +572,7 @@ where
             topic_tree: TopicTree::new_with_config(TopicTreeConfig {
                 prune_delay_ms: config.prune_delay_ms,
             }),
-            config,
+            config: Arc::new(config),
             runtime_handle,
             next_id: Default::default(),
         }
@@ -599,15 +600,14 @@ where
     ) {
         let candidates = self.find_subscribed_clients(topics).await;
         let message = Arc::new(message);
-        let send_message_max_attempts = self.config.client_send_message_max_attempts;
-        let send_message_max_timeout_ms = self.config.client_send_message_timeout_ms;
+        let config = self.config.clone();
 
         let send_message_chunk = move |chunk: Vec<TaggedClient<C, M, E>>| async move {
             futures::stream::iter(&chunk)
                 .for_each_concurrent(None, |candidate| async {
-                    for _ in 0..send_message_max_attempts {
+                    for _ in 0..config.client_send_message_max_attempts {
                         match timeout(
-                            Duration::from_millis(send_message_max_timeout_ms),
+                            Duration::from_millis(config.client_send_message_timeout_ms),
                             candidate.send_message(&message),
                         )
                         .await
@@ -622,7 +622,11 @@ where
         };
 
         let mut chunk_futures = self
-            .apply_to_chunks_in_parallel(candidates.into_values(), send_message_chunk, 100)
+            .apply_to_chunks_in_parallel(
+                candidates.into_values(),
+                send_message_chunk,
+                self.config.send_message_parallel_chunks_size,
+            )
             .await;
 
         while let Some(chunk_future) = chunk_futures.next().await {
@@ -662,20 +666,21 @@ where
         &self,
         topics: impl IntoIterator<Item = &TopicSpecifier>,
         message: M,
+        tag_filter: Option<HashSet<String>>,
     ) -> HashSet<String> {
         let candidates = self.find_subscribed_clients(topics).await;
         let message = Arc::new(message);
+        let config = self.config.clone();
+        let tag_filter = Arc::new(tag_filter);
         let mut recorded_tags = HashSet::new();
-        let send_message_max_attempts = self.config.client_send_message_max_attempts;
-        let send_message_max_timeout_ms = self.config.client_send_message_timeout_ms;
 
         let send_message_chunk = move |chunk: Vec<TaggedClient<C, M, E>>| async move {
             let recorded_tags = Mutex::new(HashSet::new());
             futures::stream::iter(&chunk)
                 .for_each_concurrent(None, |candidate| async {
-                    for _ in 0..send_message_max_attempts {
+                    for _ in 0..config.client_send_message_max_attempts {
                         match timeout(
-                            Duration::from_millis(send_message_max_timeout_ms),
+                            Duration::from_millis(config.client_send_message_timeout_ms),
                             candidate.send_message(&message),
                         )
                         .await
@@ -683,10 +688,20 @@ where
                             Err(_) => warn!("Client timed out during send operation"),
                             Ok(Err(_)) => warn!("Error sending message to client"),
                             Ok(Ok(())) => {
-                                recorded_tags
-                                    .lock()
-                                    .await
-                                    .extend(candidate.tags.read().await.deref().iter().cloned());
+                                let candidate_tags = candidate.tags.read().await;
+                                if let Some(tag_filter) = tag_filter.deref() {
+                                    let filtered_tags = candidate_tags.intersection(tag_filter);
+                                    recorded_tags
+                                        .lock()
+                                        .await
+                                        .extend(filtered_tags.into_iter().cloned());
+                                } else {
+                                    recorded_tags
+                                        .lock()
+                                        .await
+                                        .extend(candidate_tags.iter().cloned());
+                                };
+
                                 return;
                             }
                         };
@@ -697,7 +712,11 @@ where
         };
 
         let mut chunks_tags = self
-            .apply_to_chunks_in_parallel(candidates.into_values(), send_message_chunk, 19)
+            .apply_to_chunks_in_parallel(
+                candidates.into_values(),
+                send_message_chunk,
+                self.config.send_message_parallel_chunks_size,
+            )
             .await;
 
         while let Some(chunk_tags) = chunks_tags.next().await {
