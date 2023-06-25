@@ -1,8 +1,7 @@
 use std::{ops::Deref, sync::Arc};
 
-use async_trait::async_trait;
 use pubsub::{manager::Manager, topic_specifier::TopicSpecifier};
-use tokio::{runtime::Handle, sync::RwLock};
+use tokio::runtime::Handle;
 
 #[path = "../utils/mod.rs"]
 mod utils;

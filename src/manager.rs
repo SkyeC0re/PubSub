@@ -3,25 +3,18 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     ops::{AddAssign, Deref},
-    sync::{Arc, Mutex as BlockingMutex, Weak},
+    sync::Arc,
     time::Duration,
 };
 
-use itertools::Itertools;
-
-use async_trait::async_trait;
-use futures_util::{
-    stream::{futures_unordered, FuturesUnordered},
-    Future, StreamExt,
-};
+use futures_util::{stream::FuturesUnordered, Future, StreamExt};
 use log::{error, warn};
-use serde::{Deserialize, Serialize};
 
 use tokio::{
     runtime::Handle,
     sync::{Mutex, RwLock},
     task::JoinError,
-    time::{sleep, timeout},
+    time::timeout,
 };
 
 use crate::{
