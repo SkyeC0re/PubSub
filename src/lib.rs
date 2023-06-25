@@ -1,2 +1,4 @@
-pub mod models;
-pub mod pubsub_manager;
+pub mod client;
+pub mod manager;
+pub mod topic_specifier;
+mod topic_tree;

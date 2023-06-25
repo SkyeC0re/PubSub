@@ -1,13 +1,12 @@
-use std::{sync::Arc, ops::Deref};
+use std::{ops::Deref, sync::Arc};
 
 use async_trait::async_trait;
-use pubsub::{pubsub_manager::{Manager, TopicSpecifier, Client}};
+use pubsub::{manager::Manager, topic_specifier::TopicSpecifier};
 use tokio::{runtime::Handle, sync::RwLock};
 
-#[path="../utils/mod.rs"]
+#[path = "../utils/mod.rs"]
 mod utils;
 use utils::*;
-
 
 #[tokio::test]
 pub async fn test_multiple_clients_multiple_messages() {

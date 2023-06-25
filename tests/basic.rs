@@ -3,7 +3,7 @@ use std::{ops::Deref, sync::Arc};
 use async_trait::async_trait;
 use env_logger::try_init;
 use log::error;
-use pubsub::pubsub_manager::{Client, Manager, TopicSpecifier};
+use pubsub::{client::Client, manager::Manager, topic_specifier::TopicSpecifier};
 use tokio::{self, runtime::Handle, sync::RwLock};
 
 pub struct TestClient<M: Send + Sync + Clone + 'static> {

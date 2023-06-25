@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pubsub::pubsub_manager::Client;
+use pubsub::client::Client;
 use tokio::sync::RwLock;
 
 pub struct TestClient<M: Send + Sync + Clone + 'static> {

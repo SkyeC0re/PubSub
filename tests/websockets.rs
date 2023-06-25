@@ -13,8 +13,9 @@ use jwt::{
 use log::error;
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
 use pubsub::{
-    models::TopicSpecifiers,
-    pubsub_manager::{Client, Manager, TopicSpecifier, UniqId},
+    client::Client,
+    manager::{Manager, UniqId},
+    topic_specifier::{TopicSpecifier, TopicSpecifiers},
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -427,5 +428,6 @@ pub async fn test_multiple_clients() {
     sleep(Duration::from_secs(5)).await;
     block_in_place(|| async {
         listener_runtime.shutdown_background();
-    }).await;
+    })
+    .await;
 }
