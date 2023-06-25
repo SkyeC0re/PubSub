@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
-    marker::PhantomData,
     ops::{AddAssign, Deref},
     sync::Arc,
     time::Duration,

@@ -69,13 +69,6 @@ impl<K, V> Clone for TopicTree<K, V> {
 impl<K: Clone + Send + Sync + 'static + Hash + Eq, V: Clone + Send + Sync + 'static>
     TopicTree<K, V>
 {
-    pub fn new() -> Self {
-        Self {
-            tree: Arc::new(RwLock::new(TopicNode::new())),
-            config: Arc::default(),
-        }
-    }
-
     pub fn new_with_config(config: TopicTreeConfig) -> Self {
         Self {
             tree: Arc::new(RwLock::new(TopicNode::new())),

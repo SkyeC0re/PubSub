@@ -243,7 +243,7 @@ pub async fn test_client_add_and_message() {
     assert_eq!(next_message, test_message);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 pub async fn test_multiple_clients() {
     let _ = env_logger::try_init();
     let (signer, verifier) = generate_signer_verifier();
@@ -252,6 +252,12 @@ pub async fn test_multiple_clients() {
 
     let server = Arc::new(Manager::new(Handle::current()));
     let listener_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let client_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(6)
         .enable_all()
         .build()
@@ -293,7 +299,7 @@ pub async fn test_multiple_clients() {
             let port = listener_port_start_range + (i % num_listeners as i32) as u16;
             let topics = get_topics(i % client_buckets);
             let jwt = generate_jwt(&signer, topics);
-            tokio::spawn(async move {
+            client_runtime.spawn(async move {
                 let mut client = if let Some(client) = generate_client_ws_stream(port).await {
                     client
                 } else {
@@ -353,7 +359,7 @@ pub async fn test_multiple_clients() {
             let received_messages = Arc::new(RwLock::new(HashMap::<i32, i32>::new()));
             let received_messages_clone = received_messages.clone();
             let total_messages_received_clone = total_messages_received.clone();
-            tokio::spawn(async move {
+            client_runtime.spawn(async move {
                 client
                     .for_each(|res| async {
                         let message = if let Ok(message) = res {
@@ -422,6 +428,7 @@ pub async fn test_multiple_clients() {
     sleep(Duration::from_secs(5)).await;
     block_in_place(|| async {
         listener_runtime.shutdown_background();
+        client_runtime.shutdown_background();
     })
     .await;
 }
