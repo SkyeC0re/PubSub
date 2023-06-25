@@ -261,7 +261,7 @@ where
         let message = Arc::new(message);
         let config = self.config.clone();
 
-        let send_message_chunk = move |chunk: Vec<RegisteredClientManagerCopy<C, M, UniqId>>| async move {
+        let send_message_chunk = |chunk: Vec<RegisteredClientManagerCopy<C, M, UniqId>>| async move {
             futures::stream::iter(&chunk)
                 .for_each_concurrent(None, |candidate| async {
                     for _ in 0..config.client_send_message_max_attempts {
@@ -296,18 +296,23 @@ where
     }
 
     async fn apply_to_chunks_in_parallel<
+        'a,
         I: Send + 'static,
         O: Send + 'static,
         F: Future<Output = O> + Send + 'static,
     >(
-        &self,
+        &'a self,
         iter: impl IntoIterator<Item = I>,
         chunk_func: impl (FnOnce(Vec<I>) -> F) + Send + Clone + 'static,
         chunk_size: usize,
-    ) -> FuturesUnordered<impl Future<Output = Result<O, JoinError>>> {
+    ) -> FuturesUnordered<impl Future<Output = Result<O, JoinError>> + 'a> {
         let futures = FuturesUnordered::new();
         let mut chunk = Vec::with_capacity(chunk_size);
-        let fut = |chunk| async move { tokio::spawn(chunk_func(chunk)).await };
+        let fut = |chunk| async {
+            self.runtime_handle
+                .spawn(async move { chunk_func(chunk).await })
+                .await
+        };
         for elem in iter {
             chunk.push(elem);
             if chunk.len() >= chunk_size {
@@ -332,8 +337,7 @@ where
         let config = self.config.clone();
         let tag_filter = Arc::new(tag_filter);
         let mut recorded_tags = HashSet::new();
-
-        let send_message_chunk = move |chunk: Vec<RegisteredClientManagerCopy<C, M, UniqId>>| async move {
+        let send_message_chunk = |chunk: Vec<RegisteredClientManagerCopy<C, M, UniqId>>| async move {
             let recorded_tags = Mutex::new(HashSet::new());
             futures::stream::iter(&chunk)
                 .for_each_concurrent(None, |candidate| async {
