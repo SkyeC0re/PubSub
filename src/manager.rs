@@ -25,45 +25,54 @@ use crate::{
 
 pub type UniqId = u128;
 
-pub struct RegisteredClient<
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+struct RegistrationInformation<C, M, K>
+where
+    C: Client<M> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
-> {
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+{
     id: K,
-    client: Arc<C>,
-    topic_tree: TopicTree<K, TaggedClient<C, M, E>>,
-    subscribed_topics: Arc<RwLock<HashSet<TopicSpecifier>>>,
-    tags: Arc<RwLock<HashSet<String>>>,
+    topic_tree: TopicTree<K, RegisteredClientManagerCopy<C, M, K>>,
+    subscribed_topics: RwLock<HashSet<TopicSpecifier>>,
+    tags: RwLock<HashSet<String>>,
     runtime_handle: Handle,
 }
 
-impl<K, C, M, E> Drop for RegisteredClient<K, C, M, E>
+pub struct RegisteredClient<C, M, K>
 where
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
-    K: Hash + Eq + Clone + Send + Sync + 'static,
+    C: Client<M> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+{
+    client: Arc<C>,
+    registration_info: Arc<RegistrationInformation<C, M, K>>,
+}
+
+impl<C, M, K> Drop for RegisteredClient<C, M, K>
+where
+    C: Client<M> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        let topic_tree = self.topic_tree.clone();
-        let subscribed_topics = self.subscribed_topics.clone();
-        let id = self.id.clone();
-        self.runtime_handle.spawn(async move {
-            for topic in subscribed_topics.read().await.deref() {
-                topic_tree.unsubscribe_from_topic(&id, topic).await;
+        let registration_info = self.registration_info.clone();
+        self.registration_info.runtime_handle.spawn(async move {
+            let id = &registration_info.id;
+            for topic in registration_info.subscribed_topics.read().await.deref() {
+                registration_info
+                    .topic_tree
+                    .unsubscribe_from_topic(id, topic)
+                    .await;
             }
         });
     }
 }
 
-impl<K, C, M, E> Deref for RegisteredClient<K, C, M, E>
+impl<C, M, K> Deref for RegisteredClient<C, M, K>
 where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    C: Client<M> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
 {
     type Target = C;
 
@@ -72,93 +81,106 @@ where
     }
 }
 
-impl<K, C, M, E> RegisteredClient<K, C, M, E>
+impl<C, M, K> RegisteredClient<C, M, K>
 where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    C: Client<M> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
 {
     pub async fn subscribe_to_topic(&self, topic: &TopicSpecifier) {
-        if self.subscribed_topics.write().await.insert(topic.clone()) {
-            self.topic_tree
-                .subscribe_to_topic(self.id.clone(), self.get_tagged_client(), topic)
+        let registration_info = self.registration_info.as_ref();
+        if registration_info
+            .subscribed_topics
+            .write()
+            .await
+            .insert(topic.clone())
+        {
+            registration_info
+                .topic_tree
+                .subscribe_to_topic(
+                    registration_info.id.clone(),
+                    self.get_tagged_client(),
+                    topic,
+                )
                 .await;
         };
     }
 
     pub async fn unsubscribe_from_topic(&self, topic: &TopicSpecifier) {
-        if self.subscribed_topics.write().await.remove(topic) {
-            self.topic_tree
-                .unsubscribe_from_topic(&self.id, topic)
+        let registration_info = self.registration_info.as_ref();
+        if registration_info
+            .subscribed_topics
+            .write()
+            .await
+            .remove(topic)
+        {
+            registration_info
+                .topic_tree
+                .unsubscribe_from_topic(&registration_info.id, topic)
                 .await;
         };
     }
 
     pub async fn unsubscribe_from_all(&self) {
-        for topic in self.subscribed_topics.write().await.drain() {
-            self.topic_tree
-                .unsubscribe_from_topic(&self.id, &topic)
+        let registration_info = self.registration_info.as_ref();
+        for topic in registration_info.subscribed_topics.write().await.drain() {
+            registration_info
+                .topic_tree
+                .unsubscribe_from_topic(&registration_info.id, &topic)
                 .await;
         }
     }
 
     pub async fn add_tag(&self, tag: String) {
-        self.tags.write().await.insert(tag);
+        self.registration_info.tags.write().await.insert(tag);
     }
 
     pub async fn remove_tag(&self, tag: &str) {
-        self.tags.write().await.remove(tag);
+        self.registration_info.tags.write().await.remove(tag);
     }
 
-    fn get_tagged_client(&self) -> TaggedClient<C, M, E> {
-        TaggedClient {
+    fn get_tagged_client(&self) -> RegisteredClientManagerCopy<C, M, K> {
+        RegisteredClientManagerCopy {
             client: self.client.clone(),
-            tags: self.tags.clone(),
-            _message_type: PhantomData,
-            _error_type: PhantomData,
+            registration_info: self.registration_info.clone(),
         }
     }
 }
 
-pub struct TaggedClient<C, M, E>
+pub struct RegisteredClientManagerCopy<C, M, K>
 where
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    C: Client<M> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
 {
     client: Arc<C>,
-    tags: Arc<RwLock<HashSet<String>>>,
-    _message_type: PhantomData<&'static M>,
-    _error_type: PhantomData<&'static E>,
+    registration_info: Arc<RegistrationInformation<C, M, K>>,
 }
 
-impl<C, M, E> Deref for TaggedClient<C, M, E>
+impl<C, M, K> Clone for RegisteredClientManagerCopy<C, M, K>
 where
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    C: Client<M> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            registration_info: self.registration_info.clone(),
+        }
+    }
+}
+
+impl<C, M, K> Deref for RegisteredClientManagerCopy<C, M, K>
+where
+    C: Client<M> + ?Sized + Send + Sync + 'static,
+    M: Send + Sync + 'static,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
 {
     type Target = C;
 
     fn deref(&self) -> &Self::Target {
         self.client.as_ref()
-    }
-}
-
-impl<C, M, E> Clone for TaggedClient<C, M, E>
-where
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
-    M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
-{
-    fn clone(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            tags: self.tags.clone(),
-            _message_type: PhantomData,
-            _error_type: PhantomData,
-        }
     }
 }
 
@@ -181,24 +203,22 @@ impl Default for ManagerConfig {
     }
 }
 
-pub struct Manager<K, C, M = (), E = ()>
+pub struct Manager<C, M = (), K = UniqId>
 where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    C: Client<M> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
+    K: Hash + Eq + Clone + Send + Sync + 'static,
 {
-    topic_tree: TopicTree<K, TaggedClient<C, M, E>>,
+    topic_tree: TopicTree<K, RegisteredClientManagerCopy<C, M, K>>,
     config: Arc<ManagerConfig>,
     runtime_handle: Handle,
     next_id: RwLock<UniqId>,
 }
 
-impl<C, M, E> Manager<UniqId, C, M, E>
+impl<C, M> Manager<C, M, UniqId>
 where
-    C: Client<M, E> + ?Sized + Send + Sync + 'static,
+    C: Client<M> + ?Sized + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
 {
     /// Creates a new message manager using a handle to the runtime used for internal actions and with the default config.
     pub fn new(runtime_handle: Handle) -> Self {
@@ -221,7 +241,7 @@ where
     pub async fn find_subscribed_clients(
         &self,
         topics: impl IntoIterator<Item = &TopicSpecifier>,
-    ) -> HashMap<UniqId, TaggedClient<C, M, E>> {
+    ) -> HashMap<UniqId, RegisteredClientManagerCopy<C, M, UniqId>> {
         let mut candidate_set = HashMap::new();
         for topic in topics {
             self.topic_tree
@@ -241,7 +261,7 @@ where
         let message = Arc::new(message);
         let config = self.config.clone();
 
-        let send_message_chunk = move |chunk: Vec<TaggedClient<C, M, E>>| async move {
+        let send_message_chunk = move |chunk: Vec<RegisteredClientManagerCopy<C, M, UniqId>>| async move {
             futures::stream::iter(&chunk)
                 .for_each_concurrent(None, |candidate| async {
                     for _ in 0..config.client_send_message_max_attempts {
@@ -313,7 +333,7 @@ where
         let tag_filter = Arc::new(tag_filter);
         let mut recorded_tags = HashSet::new();
 
-        let send_message_chunk = move |chunk: Vec<TaggedClient<C, M, E>>| async move {
+        let send_message_chunk = move |chunk: Vec<RegisteredClientManagerCopy<C, M, UniqId>>| async move {
             let recorded_tags = Mutex::new(HashSet::new());
             futures::stream::iter(&chunk)
                 .for_each_concurrent(None, |candidate| async {
@@ -327,7 +347,7 @@ where
                             Err(_) => warn!("Client timed out during send operation"),
                             Ok(Err(_)) => warn!("Error sending message to client"),
                             Ok(Ok(())) => {
-                                let candidate_tags = candidate.tags.read().await;
+                                let candidate_tags = candidate.registration_info.tags.read().await;
                                 if let Some(tag_filter) = tag_filter.deref() {
                                     let filtered_tags = candidate_tags.intersection(tag_filter);
                                     recorded_tags
@@ -369,43 +389,45 @@ where
     }
 
     /// Registers a client on the manager, granting it a unique id.
-    pub async fn register_client(&self, client: Arc<C>) -> RegisteredClient<UniqId, C, M, E> {
+    pub async fn register_client(&self, client: Arc<C>) -> RegisteredClient<C, M, UniqId> {
         let mut id_write_guard = self.next_id.write().await;
         let id = id_write_guard.clone();
         id_write_guard.add_assign(&1);
 
-        RegisteredClient {
+        let registration_info = RegistrationInformation {
             id,
-            client,
             topic_tree: self.topic_tree.clone(),
             subscribed_topics: Default::default(),
             tags: Default::default(),
             runtime_handle: self.runtime_handle.clone(),
+        };
+
+        RegisteredClient {
+            client,
+            registration_info: Arc::new(registration_info),
         }
     }
 }
 
-impl<C, M, E> Manager<UniqId, C, M, E>
+impl<C, M> Manager<C, M, UniqId>
 where
-    C: Client<M, E> + Send + Sync + 'static,
+    C: Client<M> + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
 {
-    pub async fn register_raw_client(&self, client: C) -> RegisteredClient<UniqId, C, M, E> {
+    pub async fn register_raw_client(&self, client: C) -> RegisteredClient<C, M, UniqId> {
         self.register_client(Arc::new(client)).await
     }
 }
 
-impl<C, M, E> Manager<UniqId, Mutex<C>, M, E>
+impl<C, M> Manager<Mutex<C>, M, UniqId>
 where
-    C: MutableClient<M, E> + Send + Sync + 'static,
+    C: MutableClient<M> + Send + Sync + 'static,
     M: Send + Sync + 'static,
-    E: Send + Sync + 'static,
 {
     pub async fn register_raw_mutable_client(
         &self,
         client: C,
-    ) -> RegisteredClient<UniqId, Mutex<C>, M, E> {
+    ) -> RegisteredClient<Mutex<C>, M, UniqId> {
         self.register_client(Arc::new(Mutex::new(client))).await
     }
 }

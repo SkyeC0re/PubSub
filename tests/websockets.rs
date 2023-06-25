@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::{stream::SplitSink, Sink, SinkExt, StreamExt, TryStreamExt};
+use futures_util::{stream::SplitSink, Sink, SinkExt, StreamExt};
 use jwt::{
     Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyWithKey, VerifyingAlgorithm,
 };
@@ -92,7 +92,7 @@ struct ExclusiveSink<T: Sink<Message>> {
 }
 
 #[async_trait]
-impl<T: Sink<Message> + Send + Sync + Unpin> Client<Message, ()> for ExclusiveSink<T> {
+impl<T: Sink<Message> + Send + Sync + Unpin> Client<Message> for ExclusiveSink<T> {
     async fn send_message(&self, message: &Message) -> Result<(), ()> {
         if self.sink.lock().await.send(message.clone()).await.is_err() {
             return Err(());
@@ -104,13 +104,7 @@ impl<T: Sink<Message> + Send + Sync + Unpin> Client<Message, ()> for ExclusiveSi
 fn generate_client_emitter(
     runtime_handle: Handle,
     server: Arc<
-        Manager<
-            UniqId,
-            ExclusiveSink<SplitSink<WebSocketStream<TcpStream>, Message>>,
-            //ExclusiveSink<impl Sink<Message> + Send + Sync + Unpin>,
-            Message,
-            (),
-        >,
+        Manager<ExclusiveSink<SplitSink<WebSocketStream<TcpStream>, Message>>, Message, UniqId>,
     >,
     listener: TcpListener,
     verifier: Arc<impl VerifyingAlgorithm + Send + Sync + 'static>,

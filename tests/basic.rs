@@ -19,7 +19,7 @@ impl<M: Send + Sync + Clone + 'static> TestClient<M> {
 }
 
 #[async_trait]
-impl<M: Send + Sync + Clone + 'static> Client<M, ()> for TestClient<M> {
+impl<M: Send + Sync + Clone + 'static> Client<M> for TestClient<M> {
     async fn send_message(&self, message: &M) -> Result<(), ()> {
         self.messages_received.write().await.push(message.clone());
         Ok(())
