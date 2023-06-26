@@ -31,3 +31,8 @@ openssl = "*"
 jwt = { version = "*", features = ["openssl"] }
 serde_json = "*"
 bytes = "*"
+criterion = "*"
+
+[[bench]]
+name = "websocket_benchmarks"
+harness = false
