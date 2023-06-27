@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use futures_util::{Sink, SinkExt, StreamExt};
+use criterion::{criterion_group, criterion_main, Criterion};
+use futures_util::{Future, Sink, SinkExt, StreamExt};
 use itertools::Itertools;
 use log::info;
 
@@ -54,13 +54,12 @@ struct BenchWebsocketClient<T: Sink<Message>, I> {
 impl<T: Sink<Message> + Send + Sync + Unpin, I: Send + Sync> Client<Message>
     for BenchWebsocketClient<T, I>
 {
-    async fn send_message(&self, message: &Message) -> Result<(), ()> {
-        self.sink
-            .lock()
-            .await
-            .send(message.clone())
-            .await
-            .map_err(|_| ())
+    async fn produce_handle_message_event<'a>(
+        &'a self,
+        message: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
+        let mut lock = self.sink.lock().await;
+        Box::pin(async move { lock.send(message.clone()).await.map_err(|_| ()) })
     }
 }
 
@@ -144,7 +143,7 @@ fn bench_5k_clients(c: &mut Criterion) {
         TopicSpecifiers { topics }
     }
 
-    let set_client_topics = black_box(|num_topics: u32| {
+    let set_client_topics = |num_topics: u32| {
         fn triangle_num(n: u32) -> u32 {
             n * (n + 1) >> 1
         }
@@ -164,9 +163,9 @@ fn bench_5k_clients(c: &mut Criterion) {
                 }
             }
         });
-    });
+    };
 
-    let send_message_to_topics = black_box(|num_topics: u32| {
+    let send_message_to_topics = |num_topics: u32| {
         server_runtime.block_on(async {
             futures::stream::iter(0..num_topics)
                 .for_each_concurrent(None, |i| {
@@ -191,7 +190,7 @@ fn bench_5k_clients(c: &mut Criterion) {
                 })
                 .await;
         })
-    });
+    };
 
     let num_topics = 8;
     set_client_topics(num_topics);

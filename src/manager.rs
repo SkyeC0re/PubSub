@@ -266,7 +266,7 @@ where
                     for _ in 0..config.client_send_message_max_attempts {
                         match timeout(
                             Duration::from_millis(config.client_send_message_timeout_ms),
-                            candidate.send_message(&message),
+                            candidate.produce_handle_message_event(&message).await,
                         )
                         .await
                         {
@@ -343,7 +343,7 @@ where
                     for _ in 0..config.client_send_message_max_attempts {
                         match timeout(
                             Duration::from_millis(config.client_send_message_timeout_ms),
-                            candidate.send_message(&message),
+                            candidate.produce_handle_message_event(&message).await,
                         )
                         .await
                         {

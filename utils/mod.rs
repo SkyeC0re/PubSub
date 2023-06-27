@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
+use futures_util::Future;
 use pubsub::client::Client;
 use tokio::sync::RwLock;
 
@@ -18,8 +19,14 @@ impl<M: Send + Sync + Clone + 'static> TestClient<M> {
 
 #[async_trait]
 impl<M: Send + Sync + Clone + 'static> Client<M> for TestClient<M> {
-    async fn send_message(&self, message: &M) -> Result<(), ()> {
-        self.messages_received.write().await.push(message.clone());
-        Ok(())
+    async fn produce_handle_message_event<'a>(
+        &'a self,
+        message: &'a M,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
+        let mut write_guard = self.messages_received.write().await;
+        Box::pin(async move {
+            write_guard.push(message.clone());
+            Ok(())
+        })
     }
 }
