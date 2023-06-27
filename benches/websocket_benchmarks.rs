@@ -1,39 +1,25 @@
-use std::{
-    collections::HashMap,
-    ops::{AddAssign, Deref},
-    sync::Arc,
-    time::Duration,
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use futures_util::{stream::SplitSink, Sink, SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use itertools::Itertools;
-use jwt::{
-    Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyWithKey, VerifyingAlgorithm,
-};
-use log::{error, info};
+use jwt::{Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyingAlgorithm};
+use log::info;
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
 use pubsub::{
-    client::{Client, MutableClient},
-    manager::{Manager, UniqId},
+    client::Client,
+    manager::Manager,
     topic_specifier::{TopicSpecifier, TopicSpecifiers},
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
-    runtime::Handle,
     sync::Mutex,
-    task::block_in_place,
 };
-use tokio::{
-    sync::RwLock,
-    time::{sleep, timeout},
-};
+
 use tokio_tungstenite::{
-    accept_async, connect_async,
-    tungstenite::{accept, Message},
-    MaybeTlsStream, WebSocketStream,
+    accept_async, connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
 };
 #[derive(Serialize, Deserialize)]
 struct TestMessage {
