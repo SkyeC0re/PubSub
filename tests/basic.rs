@@ -1,11 +1,9 @@
-use std::{ops::Deref, pin::Pin, sync::Arc};
+use std::{ops::Deref, sync::Arc};
 
-use async_trait::async_trait;
 use env_logger::try_init;
 
-use futures_util::Future;
-use pubsub::{client::Client, manager::Manager, topic_specifier::TopicSpecifier};
-use tokio::{self, runtime::Handle, sync::RwLock};
+use pubsub::{manager::Manager, topic_specifier::TopicSpecifier};
+use tokio::{self, runtime::Handle};
 #[path = "../utils/mod.rs"]
 mod utils;
 use utils::*;
