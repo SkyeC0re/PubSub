@@ -27,10 +27,7 @@ async-trait = "*"
 itertools = "*"
 
 [dev-dependencies]
-openssl = "*"
-jwt = { version = "*", features = ["openssl"] }
 serde_json = "*"
-bytes = "*"
 criterion = "*"
 
 [[bench]]

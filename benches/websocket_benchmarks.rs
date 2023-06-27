@@ -4,9 +4,8 @@ use async_trait::async_trait;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use futures_util::{Sink, SinkExt, StreamExt};
 use itertools::Itertools;
-use jwt::{Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyingAlgorithm};
 use log::info;
-use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
+
 use pubsub::{
     client::Client,
     manager::Manager,
@@ -28,23 +27,6 @@ struct TestMessage {
 
 const MAX_TCP_LISTENER_CONNECTIONS: u16 = 25000;
 
-pub fn generate_signer_verifier() -> (impl SigningAlgorithm, impl VerifyingAlgorithm) {
-    let rsa = Rsa::generate(2048).unwrap();
-    let rsa_pub =
-        Rsa::public_key_from_pem_pkcs1(rsa.public_key_to_pem_pkcs1().unwrap().as_slice()).unwrap();
-
-    let signer = PKeyWithDigest {
-        digest: MessageDigest::sha256(),
-        key: PKey::from_rsa(rsa).unwrap(),
-    };
-
-    let verifier = PKeyWithDigest {
-        digest: MessageDigest::sha256(),
-        key: PKey::from_rsa(rsa_pub).unwrap(),
-    };
-    (signer, verifier)
-}
-
 pub async fn generate_tcp_listener(port: u16) -> TcpListener {
     TcpListener::bind(format!("localhost:{}", port))
         .await
@@ -57,20 +39,6 @@ pub async fn generate_client_ws_stream(
         .await
         .ok()
         .map(|(stream, _)| stream)
-}
-
-pub fn generate_jwt<T: SigningAlgorithm>(signer: &T, topics: TopicSpecifiers) -> String {
-    let token = Token::new(
-        Header {
-            algorithm: signer.algorithm_type(),
-            ..Default::default()
-        },
-        topics,
-    )
-    .sign_with_key(signer)
-    .unwrap();
-
-    token.as_str().into()
 }
 
 pub fn message_from_serializable<T: Serialize>(v: &T) -> Message {
