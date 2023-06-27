@@ -6,15 +6,16 @@ use std::{
 };
 
 use async_trait::async_trait;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use futures_util::{stream::SplitSink, Sink, SinkExt, StreamExt};
+use itertools::Itertools;
 use jwt::{
     Header, PKeyWithDigest, SignWithKey, SigningAlgorithm, Token, VerifyWithKey, VerifyingAlgorithm,
 };
-use log::error;
+use log::{error, info};
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
 use pubsub::{
-    client::Client,
+    client::{Client, MutableClient},
     manager::{Manager, UniqId},
     topic_specifier::{TopicSpecifier, TopicSpecifiers},
 };
@@ -30,14 +31,16 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
-    accept_async, connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
+    accept_async, connect_async,
+    tungstenite::{accept, Message},
+    MaybeTlsStream, WebSocketStream,
 };
 #[derive(Serialize, Deserialize)]
 struct TestMessage {
     value: u32,
 }
 
-const PORT: u16 = 5000;
+const MAX_TCP_LISTENER_CONNECTIONS: u16 = 25000;
 
 pub fn generate_signer_verifier() -> (impl SigningAlgorithm, impl VerifyingAlgorithm) {
     let rsa = Rsa::generate(2048).unwrap();
@@ -88,89 +91,32 @@ pub fn message_from_serializable<T: Serialize>(v: &T) -> Message {
     Message::Text(serde_json::to_string(v).unwrap())
 }
 
-struct ExclusiveSink<T: Sink<Message>> {
+struct BenchWebsocketClient<T: Sink<Message>, I> {
     sink: Mutex<T>,
+    i: I,
 }
 
 #[async_trait]
-impl<T: Sink<Message> + Send + Sync + Unpin> Client<Message> for ExclusiveSink<T> {
+impl<T: Sink<Message> + Send + Sync + Unpin, I: Send + Sync> Client<Message>
+    for BenchWebsocketClient<T, I>
+{
     async fn send_message(&self, message: &Message) -> Result<(), ()> {
-        if self.sink.lock().await.send(message.clone()).await.is_err() {
-            return Err(());
-        }
-        Ok(())
+        self.sink
+            .lock()
+            .await
+            .send(message.clone())
+            .await
+            .map_err(|_| ())
     }
 }
 
-fn generate_client_emitter(
-    runtime_handle: Handle,
-    server: Arc<
-        Manager<ExclusiveSink<SplitSink<WebSocketStream<TcpStream>, Message>>, Message, UniqId>,
-    >,
-    listener: TcpListener,
-    verifier: Arc<impl VerifyingAlgorithm + Send + Sync + 'static>,
-) {
-    let runtime_handle_clone = runtime_handle.clone();
-    runtime_handle_clone.spawn(async move {
-        while let Ok(ws) = accept_async(listener.accept().await.unwrap().0).await {
-            let verifier = verifier.clone();
-            let (send, recv) = ws.split();
-            let send = send;
-            let client = server
-                .register_client(Arc::new(ExclusiveSink {
-                    sink: Mutex::new(send),
-                }))
-                .await;
-            runtime_handle.spawn(async move {
-                recv.for_each(|message| async {
-                    let topic_specifiers: TopicSpecifiers = if let Some(topic_specifiers) = message
-                        .ok()
-                        .and_then(|message| message.to_text().map(ToString::to_string).ok())
-                        .and_then(|text| text.verify_with_key(verifier.as_ref()).ok())
-                    {
-                        topic_specifiers
-                    } else {
-                        return;
-                    };
-
-                    for topic in topic_specifiers.topics {
-                        client.subscribe_to_topic(&topic).await;
-                    }
-
-                    let _ = client.send_message(&Message::Ping(Vec::new())).await;
-                })
-                .await;
-            });
-        }
-    });
-}
-
-fn bench_50k_clients(c: &mut Criterion) {
-    let _ = env_logger::try_init();
-    let (signer, verifier) = generate_signer_verifier();
-
+fn bench_5k_clients(c: &mut Criterion) {
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .try_init()
+        .expect("Could not build logger");
     let listener_port_start_range = 50500;
-    let num_listeners = 4;
-    let num_clients = 50000;
-    let client_buckets = 30;
-
-    fn triangle_num(n: u32) -> u32 {
-        n * (n + 1) >> 1
-    }
-
-    let total_messages = triangle_num(client_buckets as u32)
-        * (num_clients / client_buckets as u32)
-        + triangle_num(num_clients % client_buckets as u32);
-
-    error!("Messages being sent: {}", total_messages);
-
-    let verifier = Arc::new(verifier);
-
-    let listener_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
+    let num_clients = 5000;
 
     let client_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(6)
@@ -185,26 +131,58 @@ fn bench_50k_clients(c: &mut Criterion) {
         .unwrap();
 
     let server = Arc::new(Manager::new(server_runtime.handle().clone()));
+    let mut registered_clients = Vec::with_capacity(num_clients as usize);
+    server_runtime.block_on(async {
+        for (port_start_offset, chunk) in (0..num_clients)
+            .chunks(MAX_TCP_LISTENER_CONNECTIONS as usize)
+            .into_iter()
+            .enumerate()
+        {
+            let port = listener_port_start_range + port_start_offset as u16;
+            let listener = generate_tcp_listener(port).await;
+            for i in chunk {
+                client_runtime.spawn(async move {
+                    let client = generate_client_ws_stream(port).await.unwrap();
+                    client
+                        .for_each(|res| async {
+                            let message = if let Ok(message) = res {
+                                message
+                            } else {
+                                return;
+                            };
+                            match message {
+                                Message::Text(serialized_message) => {
+                                    let _message: TestMessage =
+                                        serde_json::from_str(&serialized_message).unwrap();
+                                }
+                                _ => unreachable!(),
+                            };
+                        })
+                        .await;
+                });
+                let server_side_ws_stream = accept_async(listener.accept().await.unwrap().0)
+                    .await
+                    .unwrap();
 
-    listener_runtime.block_on(async {
-        for i in 0..num_listeners {
-            let listener = generate_tcp_listener(listener_port_start_range + i).await;
-            generate_client_emitter(
-                Handle::current(),
-                server.clone(),
-                listener,
-                verifier.clone(),
-            );
+                let server_side_client = BenchWebsocketClient {
+                    sink: Mutex::new(server_side_ws_stream.split().0),
+                    i,
+                };
+
+                let registered_client = server.register_raw_client(server_side_client).await;
+
+                registered_clients.push(registered_client);
+            }
         }
     });
 
-    error!("Listeners spawned");
+    info!("Listeners spawned");
 
     fn get_topics(pos: u32) -> TopicSpecifiers {
         let topics = (0..=pos)
             .into_iter()
             .map(|i| TopicSpecifier::Subtopic {
-                topic: format!("tag-{}", i),
+                topic: format!("topic-{}", i),
                 specifier: Box::new(TopicSpecifier::ThisTopic),
             })
             .collect();
@@ -212,110 +190,73 @@ fn bench_50k_clients(c: &mut Criterion) {
         TopicSpecifiers { topics }
     }
 
-    let join_handles: Vec<_> = (0..num_clients)
-        .into_iter()
-        .map(|i| {
-            let port = listener_port_start_range + (i % num_listeners as u32) as u16;
-            let topics = get_topics(i % client_buckets);
-            let jwt = generate_jwt(&signer, topics);
-            client_runtime.spawn(async move {
-                let mut client = if let Some(client) = generate_client_ws_stream(port).await {
-                    client
-                } else {
-                    return Err(format!("Unable to create client"));
-                };
-
-                if let Err(e) = client.send(Message::Text(jwt)).await {
-                    return Err(format!(
-                        "Client {}. Error sending jwt to server, : {:?}",
-                        i, e
-                    ));
-                };
-                let message =
-                    match timeout(Duration::from_secs(10), client.select_next_some()).await {
-                        Ok(Ok(resp)) => resp,
-                        Ok(Err(e)) => {
-                            return Err(format!(
-                                "Client {}. Error during retrieval of validation response: {:?}",
-                                i, e
-                            ))
-                        }
-                        Err(e) => {
-                            return Err(format!(
-                                "Client {}. Retrieval of validation response took too long: {:?}",
-                                i, e
-                            ))
-                        }
-                    };
-
-                if !message.is_ping() {
-                    return Err(format!("Client {}. Invalid message type response", i));
-                }
-                Ok((i, client))
-            })
-        })
-        .collect();
-
-    let mut clients = Vec::new();
-    server_runtime.block_on(async {
-        for join_handle in join_handles {
-            if let Ok(Ok(join_handle)) = join_handle.await {
-                clients.push(join_handle);
-            }
+    let set_client_topics = black_box(|num_topics: u32| {
+        fn triangle_num(n: u32) -> u32 {
+            n * (n + 1) >> 1
         }
-    });
 
-    // start listeners
-    clients.into_iter().for_each(|(i, client)| {
-        client_runtime.spawn(async move {
-            client
-                .for_each(|res| async {
-                    let message = if let Ok(message) = res {
-                        message
-                    } else {
-                        return;
-                    };
-                    match message {
-                        Message::Text(serialized_message) => {
-                            let _message: TestMessage =
-                                serde_json::from_str(&serialized_message).unwrap();
-                        }
-                        _ => unreachable!(),
-                    };
-                })
-                .await;
+        let total_messages = triangle_num(num_topics as u32) * (num_clients / num_topics as u32)
+            + triangle_num(num_clients % num_topics as u32);
+        info!(
+            "Setting topics amount to {}. Expected messages sent per iteration: {}",
+            num_topics, total_messages
+        );
+        server_runtime.block_on(async {
+            for client in &registered_clients {
+                client.unsubscribe_from_all().await;
+                let pos = client.i % num_topics;
+                for topic in get_topics(pos).topics {
+                    client.subscribe_to_topic(&topic).await;
+                }
+            }
         });
     });
 
-    c.bench_function("bench_50k_clients_mid_density", |b| {
-        b.iter(|| {
-            server_runtime.block_on(async {
-                futures::stream::iter(0..client_buckets)
-                    .for_each_concurrent(None, |i| {
+    let send_message_to_topics = black_box(|num_topics: u32| {
+        server_runtime.block_on(async {
+            futures::stream::iter(0..num_topics)
+                .for_each_concurrent(None, |i| {
+                    let server = server.clone();
+                    async move {
                         let server = server.clone();
-                        async move {
-                            let server = server.clone();
-                            let join_res = tokio::spawn(async move {
-                                server
-                                    .send_message(
-                                        &vec![TopicSpecifier::Subtopic {
-                                            topic: format!("tag-{}", i),
-                                            specifier: Box::new(TopicSpecifier::ThisTopic),
-                                        }],
-                                        message_from_serializable(&TestMessage { value: i }),
-                                    )
-                                    .await;
-                            })
-                            .await;
+                        let join_res = tokio::spawn(async move {
+                            server
+                                .send_message(
+                                    &vec![TopicSpecifier::Subtopic {
+                                        topic: format!("topic-{}", i),
+                                        specifier: Box::new(TopicSpecifier::ThisTopic),
+                                    }],
+                                    message_from_serializable(&TestMessage { value: i }),
+                                )
+                                .await;
+                        })
+                        .await;
 
-                            assert!(join_res.is_ok());
-                        }
-                    })
-                    .await;
-            })
+                        assert!(join_res.is_ok());
+                    }
+                })
+                .await;
         })
+    });
+
+    let num_topics = 8;
+    set_client_topics(num_topics);
+    c.bench_function("bench_5k_clients_low_density", |b| {
+        b.iter(|| send_message_to_topics(num_topics))
+    });
+
+    let num_topics = 15;
+    set_client_topics(num_topics);
+    c.bench_function("bench_5k_clients_med_density", |b| {
+        b.iter(|| send_message_to_topics(num_topics))
+    });
+
+    let num_topics = 30;
+    set_client_topics(num_topics);
+    c.bench_function("bench_5k_clients_high_density", |b| {
+        b.iter(|| send_message_to_topics(num_topics))
     });
 }
 
-criterion_group!(benches, bench_50k_clients);
+criterion_group!(benches, bench_5k_clients);
 criterion_main!(benches);

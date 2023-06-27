@@ -195,7 +195,7 @@ impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
             prune_delay_ms: 5000,
-            send_message_parallel_chunks_size: 100,
+            send_message_parallel_chunks_size: 40,
             client_send_message_timeout_ms: 5000,
             client_send_message_max_attempts: 3,
         }
