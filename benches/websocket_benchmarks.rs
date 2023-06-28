@@ -1,25 +1,19 @@
-use std::{pin::Pin, sync::Arc};
-
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures_util::{Future, Sink, SinkExt, StreamExt};
 use itertools::Itertools;
 use log::info;
-
-use pubsub::{
-    client::Client,
-    manager::Manager,
-    topic_specifier::{TopicSpecifier, TopicSpecifiers},
-};
+use pubsub::{client::Client, manager::Manager, topic_specifier::TopicSpecifier};
 use serde::{Deserialize, Serialize};
+use std::{pin::Pin, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
-
 use tokio_tungstenite::{
     accept_async, connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
 };
+
 #[derive(Serialize, Deserialize)]
 struct TestMessage {
     value: u32,
@@ -131,19 +125,24 @@ fn bench_5k_clients(c: &mut Criterion) {
 
     info!("Listeners spawned");
 
-    fn get_topics(pos: u32) -> TopicSpecifiers {
-        let topics = (0..=pos)
+    fn get_topics(pos: u32) -> Vec<TopicSpecifier> {
+        (0..=pos)
             .into_iter()
             .map(|i| TopicSpecifier::Subtopic {
                 topic: format!("topic-{}", i),
                 specifier: Box::new(TopicSpecifier::ThisTopic),
             })
-            .collect();
-
-        TopicSpecifiers { topics }
+            .collect()
     }
 
-    let set_client_topics = |num_topics: u32| {
+    fn get_tags(pos: u32) -> Vec<String> {
+        (0..=pos)
+            .into_iter()
+            .map(|i| format!("tag-{}", i))
+            .collect()
+    }
+
+    let set_client_topics_and_tags = |num_topics: u32| {
         fn triangle_num(n: u32) -> u32 {
             n * (n + 1) >> 1
         }
@@ -157,9 +156,13 @@ fn bench_5k_clients(c: &mut Criterion) {
         server_runtime.block_on(async {
             for client in &registered_clients {
                 client.unsubscribe_from_all().await;
+                client.remove_all_tags().await;
                 let pos = client.i % num_topics;
-                for topic in get_topics(pos).topics {
+                for topic in get_topics(pos) {
                     client.subscribe_to_topic(&topic).await;
+                }
+                for tag in get_tags(pos) {
+                    client.add_tag(tag).await;
                 }
             }
         });
@@ -192,22 +195,59 @@ fn bench_5k_clients(c: &mut Criterion) {
         })
     };
 
+    let send_message_to_topics_collect_tags = |num_topics: u32| {
+        server_runtime.block_on(async {
+            futures::stream::iter(0..num_topics)
+                .for_each_concurrent(None, |i| {
+                    let server = server.clone();
+                    async move {
+                        let server = server.clone();
+                        let join_res = tokio::spawn(async move {
+                            server
+                                .send_message_and_record_tags(
+                                    &vec![TopicSpecifier::Subtopic {
+                                        topic: format!("topic-{}", i),
+                                        specifier: Box::new(TopicSpecifier::ThisTopic),
+                                    }],
+                                    message_from_serializable(&TestMessage { value: i }),
+                                    Some(get_tags(i).into_iter().collect()),
+                                )
+                                .await;
+                        })
+                        .await;
+
+                        assert!(join_res.is_ok());
+                    }
+                })
+                .await;
+        })
+    };
+
     let num_topics = 8;
-    set_client_topics(num_topics);
+    set_client_topics_and_tags(num_topics);
     c.bench_function("bench_5k_clients_low_density", |b| {
         b.iter(|| send_message_to_topics(num_topics))
     });
+    c.bench_function("bench_5k_clients_low_density_collect_tags", |b| {
+        b.iter(|| send_message_to_topics_collect_tags(num_topics))
+    });
 
     let num_topics = 15;
-    set_client_topics(num_topics);
+    set_client_topics_and_tags(num_topics);
     c.bench_function("bench_5k_clients_med_density", |b| {
         b.iter(|| send_message_to_topics(num_topics))
     });
+    c.bench_function("bench_5k_clients_med_density_collect_tags", |b| {
+        b.iter(|| send_message_to_topics_collect_tags(num_topics))
+    });
 
     let num_topics = 30;
-    set_client_topics(num_topics);
+    set_client_topics_and_tags(num_topics);
     c.bench_function("bench_5k_clients_high_density", |b| {
         b.iter(|| send_message_to_topics(num_topics))
+    });
+    c.bench_function("bench_5k_clients_med_density_collect_tags", |b| {
+        b.iter(|| send_message_to_topics_collect_tags(num_topics))
     });
 }
 

@@ -138,6 +138,10 @@ where
         self.registration_info.tags.write().await.remove(tag);
     }
 
+    pub async fn remove_all_tags(&self) {
+        self.registration_info.tags.write().await.clear();
+    }
+
     fn get_tagged_client(&self) -> RegisteredClientManagerCopy<C, M, K> {
         RegisteredClientManagerCopy {
             client: self.client.clone(),
