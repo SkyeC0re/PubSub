@@ -341,9 +341,11 @@ where
         let tag_filter = Arc::new(tag_filter);
         let mut recorded_tags = HashSet::new();
         let send_message_chunk = |chunk: Vec<RegisteredClientManagerCopy<C, M, UniqId>>| async move {
-            let recorded_tags = Mutex::new(HashSet::new());
-            futures::stream::iter(&chunk)
-                .for_each_concurrent(None, |candidate| async {
+            let mut recorded_tags = HashSet::new();
+
+            let mut client_tag_futures = chunk
+                .iter()
+                .map(|candidate| async {
                     for _ in 0..config.client_send_message_max_attempts {
                         match timeout(
                             Duration::from_millis(config.client_send_message_timeout_ms),
@@ -351,30 +353,29 @@ where
                         )
                         .await
                         {
-                            Err(_) => warn!("Client timed out during send operation"),
-                            Ok(Err(_)) => warn!("Error sending message to client"),
                             Ok(Ok(())) => {
                                 let candidate_tags = candidate.registration_info.tags.read().await;
-                                if let Some(tag_filter) = tag_filter.deref() {
-                                    let filtered_tags = candidate_tags.intersection(tag_filter);
-                                    recorded_tags
-                                        .lock()
-                                        .await
-                                        .extend(filtered_tags.into_iter().cloned());
-                                } else {
-                                    recorded_tags
-                                        .lock()
-                                        .await
-                                        .extend(candidate_tags.iter().cloned());
-                                };
-
-                                return;
+                                return Some(candidate_tags);
                             }
+                            Ok(Err(_)) => warn!("Error sending message to client"),
+                            Err(_) => warn!("Client timed out during send operation"),
                         };
                     }
+                    None
                 })
-                .await;
-            recorded_tags.into_inner()
+                .collect::<FuturesUnordered<_>>();
+
+            while let Some(client_tags) = client_tag_futures.next().await {
+                if let Some(client_tags) = client_tags {
+                    if let Some(tag_filter) = tag_filter.deref() {
+                        let filtered_tags = client_tags.intersection(tag_filter);
+                        recorded_tags.extend(filtered_tags.into_iter().cloned());
+                    } else {
+                        recorded_tags.extend(client_tags.iter().cloned());
+                    };
+                }
+            }
+            recorded_tags
         };
 
         let mut chunks_tags = self
